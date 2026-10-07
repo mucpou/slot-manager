@@ -53,11 +53,11 @@ const CF_R2_SECRET_ACCESS_KEY = process.env.CF_R2_SECRET_ACCESS_KEY;
 const CF_R2_BUCKET_NAME = process.env.CF_R2_BUCKET_NAME || 'artgal-assets';
 const CF_PUBLIC_DOMAIN = process.env.CF_PUBLIC_DOMAIN;
 
-// Cloudflare Edge Cache Invalidation (Required)
-const CF_ZONE_ID = process.env.CF_ZONE_ID;
-const CF_API_TOKEN = process.env.CF_API_TOKEN;
+// Cloudflare Edge Cache Invalidation (Optional)
+const CF_ZONE_ID = process.env.CF_ZONE_ID || '';
+const CF_API_TOKEN = process.env.CF_API_TOKEN || '';
 
-// Validate that required variables are present
+// Validate that strictly required variables are present
 const requiredEnvVars = [
     'DISCORD_BOT_TOKEN',
     'CLOUD_NAME',
@@ -66,9 +66,7 @@ const requiredEnvVars = [
     'CF_ACCOUNT_ID',
     'CF_R2_ACCESS_KEY_ID',
     'CF_R2_SECRET_ACCESS_KEY',
-    'CF_PUBLIC_DOMAIN',
-    'CF_ZONE_ID',
-    'CF_API_TOKEN'
+    'CF_PUBLIC_DOMAIN'
 ];
 
 for (const envVar of requiredEnvVars) {
