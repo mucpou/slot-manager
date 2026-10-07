@@ -2,9 +2,9 @@
     "name": "art-gallery-discord-bot",
     "version": "1.0.0",
     "description": "Discord bot managing image slots, syncing to Cloudinary and Cloudflare R2",
-    "main": "RailwayBot.js",
+    "main": "Railwaybot.js",
     "scripts": {
-        "start": "node RailwayBot.js"
+        "start": "node Railwaybot.js"
     },
     "engines": {
         "node": ">=18.0.0 <21.0.0"
