@@ -53,8 +53,6 @@ const CF_R2_SECRET_ACCESS_KEY = process.env.CF_R2_SECRET_ACCESS_KEY;
 const CF_R2_BUCKET_NAME = process.env.CF_R2_BUCKET_NAME || 'artgal-assets';
 const CF_PUBLIC_DOMAIN = process.env.CF_PUBLIC_DOMAIN;
 
-// Cloudflare Edge Cache Invalidation (Required)
-const CF_ZONE_ID = process.env.CF_ZONE_ID;
 // Cloudflare Edge Cache Invalidation (Optional)
 const CF_ZONE_ID = process.env.CF_ZONE_ID || '';
 const CF_API_TOKEN = process.env.CF_API_TOKEN || '';
@@ -76,7 +74,6 @@ for (const envVar of requiredEnvVars) {
         console.error(`FATAL ERROR: Environment variable "${envVar}" is missing.`);
         process.exit(1);
     }
-}
 }
 
 // Initialize Cloudflare R2 S3 Client
