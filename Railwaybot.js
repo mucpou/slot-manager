@@ -46,16 +46,16 @@ cloudinary.config({
     api_secret: CLOUDINARY_API_SECRET
 });
 
-// Cloudflare R2 & Cache Configuration
+// Cloudflare R2 & Domain Configuration
 const CF_ACCOUNT_ID = process.env.CF_ACCOUNT_ID;
 const CF_R2_ACCESS_KEY_ID = process.env.CF_R2_ACCESS_KEY_ID;
 const CF_R2_SECRET_ACCESS_KEY = process.env.CF_R2_SECRET_ACCESS_KEY;
 const CF_R2_BUCKET_NAME = process.env.CF_R2_BUCKET_NAME || 'artgal-assets';
 const CF_PUBLIC_DOMAIN = process.env.CF_PUBLIC_DOMAIN;
 
-// Cloudflare Edge Cache Invalidation
-const CF_ZONE_ID = process.env.CF_ZONE_ID;
-const CF_API_TOKEN = process.env.CF_API_TOKEN;
+// Cloudflare Edge Cache Invalidation (Inactive / Optional for now)
+const CF_ZONE_ID = process.env.CF_ZONE_ID || null;
+const CF_API_TOKEN = process.env.CF_API_TOKEN || null;
 
 // Validate that required variables are present
 const requiredEnvVars = [
@@ -66,9 +66,9 @@ const requiredEnvVars = [
     'CF_ACCOUNT_ID',
     'CF_R2_ACCESS_KEY_ID',
     'CF_R2_SECRET_ACCESS_KEY',
-    'CF_PUBLIC_DOMAIN',
-    'CF_ZONE_ID',
-    'CF_API_TOKEN'
+    'CF_PUBLIC_DOMAIN'
+    // 'CF_ZONE_ID',   // Inactive for now
+    // 'CF_API_TOKEN'  // Inactive for now
 ];
 
 for (const envVar of requiredEnvVars) {
@@ -182,8 +182,13 @@ async function uploadToR2(body, key, contentType) {
     return r2Client.send(command);
 }
 
-// Instantly purges the Cloudflare CDN edge cache
+// Instantly purges the Cloudflare CDN edge cache (Inactive if credentials missing)
 async function purgeCloudflareUrls(urls) {
+    if (!CF_ZONE_ID || !CF_API_TOKEN) {
+        // Silently skip cache purge while inactive
+        return;
+    }
+
     try {
         const res = await fetch(`https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/purge_cache`, {
             method: 'POST',
@@ -553,10 +558,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
             });
         }
 
-        // Remove channel permission overwrite for submitter
         await interaction.channel.permissionOverwrites.delete(targetUserId).catch(() => { });
 
-        // Disable button in prompt
         const disabledRow = ActionRowBuilder.from(interaction.message.components[0]);
         disabledRow.components[0].setDisabled(true).setLabel('Permission Revoked');
 
@@ -737,7 +740,6 @@ client.on(Events.MessageCreate, async (message) => {
     const isAdmin = message.member.permissions.has(PermissionFlagsBits.Administrator);
     const isMod = message.member.roles.cache.has(modRole.id);
 
-    // Let mods and admins post messages without triggering review loops
     if (isMod && !isAdmin) {
         return;
     }
@@ -760,10 +762,8 @@ client.on(Events.MessageCreate, async (message) => {
         const arrayBuffer = await response.arrayBuffer();
         const rawBuffer = Buffer.from(arrayBuffer);
 
-        // ACCESS RETAINED: We do NOT delete the submitter's channel permission overwrite here.
         submitter.send(`Your submission for Slot #${slotNumber} has been received and is waiting for moderator approval. You retain channel access until it is accepted.`).catch(() => { });
 
-        // Ensure moderators can view and interact with the channel
         await message.channel.permissionOverwrites.edit(modRole.id, {
             ViewChannel: true,
             ReadMessageHistory: true,
@@ -779,7 +779,6 @@ client.on(Events.MessageCreate, async (message) => {
             .setFooter({ text: 'React ✅ to approve | React ❌ to reject' })
             .setTimestamp();
 
-        // Button to manually revoke slot permissions at any time during review
         const revokeButtonRow = new ActionRowBuilder().addComponents(
             new ButtonBuilder()
                 .setCustomId(`revoke_slot_perm:${slotNumber}:${submitter.id}`)
@@ -797,7 +796,6 @@ client.on(Events.MessageCreate, async (message) => {
         await modPrompt.react('✅');
         await modPrompt.react('❌');
 
-        // STRICT FILTER: Only Content Moderators and Administrators reactions count
         const collector = modPrompt.createReactionCollector({
             filter: async (reaction, user) => {
                 if (user.bot) return false;
@@ -808,7 +806,6 @@ client.on(Events.MessageCreate, async (message) => {
 
                 const isAuthorized = member.roles.cache.has(modRole.id) || member.permissions.has(PermissionFlagsBits.Administrator);
                 if (!isAuthorized) {
-                    // Instantly strip unauthorized user reactions
                     await reaction.users.remove(user.id).catch(() => { });
                     return false;
                 }
@@ -825,7 +822,6 @@ client.on(Events.MessageCreate, async (message) => {
             await message.channel.permissionOverwrites.delete(modRole.id).catch(() => { });
 
             if (reaction.emoji.name === '✅') {
-                // ENTRY ACCEPTED: Revoke slot permission now
                 await message.channel.permissionOverwrites.delete(submitter.id).catch(() => { });
 
                 const statusMsg = await message.channel.send(`Approved by ${user.tag}. Converting to WebP and updating Slotblurbs.txt...`);
@@ -873,7 +869,6 @@ client.on(Events.MessageCreate, async (message) => {
                 submitter.send(`Your submission for Slot #${slotNumber} was accepted and is live. Your access to the slot channel has now ended.`).catch(() => { });
 
             } else if (reaction.emoji.name === '❌') {
-                // ENTRY REJECTED: User retains access to submit again
                 await message.channel.send(`Submission rejected by ${user.tag}. Resetting channel view...`);
                 submitter.send(`Your submission for Slot #${slotNumber} was rejected by a moderator. You retain channel access to submit a revised image and blurb.`).catch(() => { });
 
