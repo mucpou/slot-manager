@@ -53,11 +53,11 @@ const CF_R2_SECRET_ACCESS_KEY = process.env.CF_R2_SECRET_ACCESS_KEY;
 const CF_R2_BUCKET_NAME = process.env.CF_R2_BUCKET_NAME || 'artgal-assets';
 const CF_PUBLIC_DOMAIN = process.env.CF_PUBLIC_DOMAIN;
 
-// Cloudflare Edge Cache Invalidation (Optional)
-const CF_ZONE_ID = process.env.CF_ZONE_ID || '';
-const CF_API_TOKEN = process.env.CF_API_TOKEN || '';
+// Cloudflare Edge Cache Invalidation
+const CF_ZONE_ID = process.env.CF_ZONE_ID;
+const CF_API_TOKEN = process.env.CF_API_TOKEN;
 
-// Validate that strictly required variables are present
+// Validate that required variables are present
 const requiredEnvVars = [
     'DISCORD_BOT_TOKEN',
     'CLOUD_NAME',
@@ -66,7 +66,9 @@ const requiredEnvVars = [
     'CF_ACCOUNT_ID',
     'CF_R2_ACCESS_KEY_ID',
     'CF_R2_SECRET_ACCESS_KEY',
-    'CF_PUBLIC_DOMAIN'
+    'CF_PUBLIC_DOMAIN',
+    'CF_ZONE_ID',
+    'CF_API_TOKEN'
 ];
 
 for (const envVar of requiredEnvVars) {
@@ -128,16 +130,6 @@ function getPermanentImageUrl(slotNumber) {
 // Returns the permanent public text URL for the master blurbs file
 function getPermanentBlurbsUrl() {
     return `https://res.cloudinary.com/${CLOUD_NAME}/raw/upload/Slotblurbs.txt`;
-}
-
-// Returns the permanent public text URL for Lights.txt
-function getPermanentLightsUrl() {
-    return `https://res.cloudinary.com/${CLOUD_NAME}/raw/upload/Lights.txt`;
-}
-
-// Returns the permanent public URL for the last update record
-function getPermanentLastUpdateUrl() {
-    return `https://res.cloudinary.com/${CLOUD_NAME}/raw/upload/LastUpdate.txt`;
 }
 
 // Streams text directly to Cloudinary memory
@@ -216,22 +208,18 @@ async function purgeCloudflareUrls(urls) {
 // LIGHT SWITCHES LOGIC & SYNCHRONIZATION
 // ==========================================
 
-// Formats the switches array to exact Lights.txt syntax
 function formatLightsFile(switches) {
     return switches.map(s => `${s.key} = ${s.state}`).join('\n') + '\n';
 }
 
-// Uploads Lights.txt and metadata to both Cloudinary and Cloudflare R2
 async function syncLightsToStorage(switches) {
     const rawLightsText = formatLightsFile(switches);
     const metaJson = JSON.stringify(switches, null, 2);
 
     await Promise.all([
-        // Cloudinary uploads
         uploadTextStream(rawLightsText, 'Lights.txt'),
         uploadTextStream(metaJson, 'LightsMeta.json'),
 
-        // Cloudflare R2 uploads
         uploadToR2(Buffer.from(rawLightsText, 'utf-8'), 'Lights.txt', 'text/plain; charset=utf-8'),
         uploadToR2(Buffer.from(metaJson, 'utf-8'), 'LightsMeta.json', 'application/json; charset=utf-8')
     ]);
@@ -242,7 +230,6 @@ async function syncLightsToStorage(switches) {
     ]);
 }
 
-// Loads existing switches configuration from Cloudflare R2 / Cloudinary
 async function loadSwitchesFromStorage() {
     try {
         const response = await fetch(`${CF_PUBLIC_DOMAIN}/LightsMeta.json?t=${Date.now()}`);
@@ -252,9 +239,7 @@ async function loadSwitchesFromStorage() {
                 return data;
             }
         }
-    } catch (err) {
-        // Fallback to reading raw Lights.txt
-    }
+    } catch (err) { }
 
     try {
         const response = await fetch(`${CF_PUBLIC_DOMAIN}/Lights.txt?t=${Date.now()}`);
@@ -273,14 +258,11 @@ async function loadSwitchesFromStorage() {
                 });
             }
         }
-    } catch (err) {
-        // Retain default switches
-    }
+    } catch (err) { }
 
     return switchesState;
 }
 
-// Builds the Discord Embed for an individual switch
 function buildSwitchEmbed(sw) {
     const stateSquare = sw.state ? '🟩' : '🟥';
     const stateLabel = sw.state ? 'ON' : 'OFF';
@@ -289,13 +271,10 @@ function buildSwitchEmbed(sw) {
         .setTitle(`${stateSquare} ${sw.key}`)
         .setColor(sw.state ? '#2ecc71' : '#e74c3c')
         .setDescription(sw.description || 'No description provided.')
-        .addFields(
-            { name: 'State', value: `${stateSquare} ${stateLabel}`, inline: true }
-        )
+        .addFields({ name: 'State', value: `${stateSquare} ${stateLabel}`, inline: true })
         .setFooter({ text: `Switch ID: ${sw.id}` });
 }
 
-// Builds the ON and OFF button ActionRow for a switch
 function buildSwitchActionRow(sw) {
     return new ActionRowBuilder().addComponents(
         new ButtonBuilder()
@@ -311,7 +290,6 @@ function buildSwitchActionRow(sw) {
     );
 }
 
-// Re-renders the entire #light-switches channel
 async function renderLightSwitchesChannel(channel, switches) {
     const messages = await channel.messages.fetch({ limit: 100 });
     for (const msg of messages.values()) {
@@ -423,7 +401,7 @@ function buildPreviewEmbed(slotNumber, version = null, blurbText = 'No text load
             value: blurbText.length > 1024 ? blurbText.slice(0, 1020) + '...' : blurbText
         })
         .setImage(displayUrl)
-        .setFooter({ text: 'One-time access: uploading revokes access' })
+        .setFooter({ text: 'Access is retained until your submission is accepted.' })
         .setTimestamp();
 }
 
@@ -476,7 +454,6 @@ async function setupChannels(guild) {
         });
     }
 
-    // Initialize 16 Image Slot channels
     for (let i = 1; i <= 16; i++) {
         const channelName = `slot-${i}`;
         let channel = guild.channels.cache.find(
@@ -503,7 +480,6 @@ async function setupChannels(guild) {
         }
     }
 
-    // Initialize #light-switches channel
     let lightsChannel = guild.channels.cache.find(
         c => c.name === 'light-switches' && c.parentId === category.id
     );
@@ -556,37 +532,68 @@ client.on(Events.ClientReady, async () => {
     }
 });
 
-// Listener: Embedded Button Interactions for Light Switches
+// Listener: Embedded Button Interactions
 client.on(Events.InteractionCreate, async (interaction) => {
     if (!interaction.isButton()) return;
 
     const { customId } = interaction;
-    if (!customId.startsWith('light_on_') && !customId.startsWith('light_off_')) return;
 
-    const isTurningOn = customId.startsWith('light_on_');
-    const switchId = parseInt(customId.replace(isTurningOn ? 'light_on_' : 'light_off_', ''), 10);
+    // --- BUTTON: Remove Slot Permission ---
+    if (customId.startsWith('revoke_slot_perm:')) {
+        const [, slotNumber, targetUserId] = customId.split(':');
+        const modRole = await getOrCreateModeratorRole(interaction.guild);
 
-    const sw = switchesState.find(s => s.id === switchId);
-    if (!sw) {
-        return interaction.reply({ content: 'Switch not found.', ephemeral: true });
+        const isAuthorized = interaction.member.permissions.has(PermissionFlagsBits.Administrator) ||
+            interaction.member.roles.cache.has(modRole.id);
+
+        if (!isAuthorized) {
+            return interaction.reply({
+                content: 'Only Content Moderators and Administrators can remove slot permissions.',
+                ephemeral: true
+            });
+        }
+
+        // Remove channel permission overwrite for submitter
+        await interaction.channel.permissionOverwrites.delete(targetUserId).catch(() => { });
+
+        // Disable button in prompt
+        const disabledRow = ActionRowBuilder.from(interaction.message.components[0]);
+        disabledRow.components[0].setDisabled(true).setLabel('Permission Revoked');
+
+        await interaction.update({ components: [disabledRow] }).catch(() => { });
+        await interaction.channel.send(`🚫 **Slot permissions for <@${targetUserId}> were manually removed by <@${interaction.user.id}>.**`);
+
+        const targetMember = await interaction.guild.members.fetch(targetUserId).catch(() => null);
+        if (targetMember) {
+            targetMember.send(`Your access to **#slot-${slotNumber}** has been revoked.`).catch(() => { });
+        }
+        return;
     }
 
-    try {
-        await interaction.deferUpdate();
+    // --- BUTTONS: Light Switches ---
+    if (customId.startsWith('light_on_') || customId.startsWith('light_off_')) {
+        const isTurningOn = customId.startsWith('light_on_');
+        const switchId = parseInt(customId.replace(isTurningOn ? 'light_on_' : 'light_off_', ''), 10);
 
-        sw.state = isTurningOn;
-        await syncLightsToStorage(switchesState);
-
-        await interaction.editReply({
-            embeds: [buildSwitchEmbed(sw)],
-            components: [buildSwitchActionRow(sw)]
-        });
-    } catch (err) {
-        if (err?.code === 10062) {
-            console.warn(`Interaction timed out or acknowledged elsewhere for Switch #${switchId}`);
-            return;
+        const sw = switchesState.find(s => s.id === switchId);
+        if (!sw) {
+            return interaction.reply({ content: 'Switch not found.', ephemeral: true });
         }
-        console.error('Error handling button interaction:', err);
+
+        try {
+            await interaction.deferUpdate();
+
+            sw.state = isTurningOn;
+            await syncLightsToStorage(switchesState);
+
+            await interaction.editReply({
+                embeds: [buildSwitchEmbed(sw)],
+                components: [buildSwitchActionRow(sw)]
+            });
+        } catch (err) {
+            if (err?.code === 10062) return;
+            console.error('Error handling button interaction:', err);
+        }
     }
 });
 
@@ -634,7 +641,7 @@ client.on(Events.MessageCreate, async (message) => {
 
         const parts = message.content.trim().split(/\s+/);
         if (parts.length < 3) {
-            return message.reply('Usage: `!setswitchdesc <switch number or name> <new description>`\nExample: `!setswitchdesc 2 Kitchen Lights`');
+            return message.reply('Usage: `!setswitchdesc <switch number or name> <new description>`');
         }
 
         const targetIdentifier = parts[1].toLowerCase().replace('switch', '');
@@ -687,9 +694,37 @@ client.on(Events.MessageCreate, async (message) => {
             AttachFiles: true
         });
 
-        message.reply(`Granted **${targetMember.displayName}** one-time access to **#${channelName}**.`);
-        targetMember.send(`You have been given temporary access to **#${channelName}**. Drop your image and blurb text there.`).catch(() => { });
+        message.reply(`Granted **${targetMember.displayName}** access to **#${channelName}**. (Access retained until accepted).`);
+        targetMember.send(`You have been given access to **#${channelName}**. Drop your image and blurb text there. Your access will remain active until your submission is accepted.`).catch(() => { });
         return;
+    }
+
+    // ----------------------------------------------------
+    // COMMAND: !revoke @User <SlotNumber>
+    // ----------------------------------------------------
+    if (message.content.startsWith('!revoke')) {
+        if (!message.member.permissions.has(PermissionFlagsBits.Administrator)) {
+            return message.reply('Only administrators can revoke access.');
+        }
+
+        const targetMember = message.mentions.members.first();
+        const args = message.content.split(' ');
+        const slotArg = args.find(arg => !isNaN(arg) && arg.trim() !== '');
+        const slotNumber = parseInt(slotArg, 10);
+
+        if (!targetMember || isNaN(slotNumber) || slotNumber < 1 || slotNumber > 16) {
+            return message.reply('Usage: `!revoke @user <1-16>`\nExample: `!revoke @Alex 4`');
+        }
+
+        const channelName = `slot-${slotNumber}`;
+        const targetChannel = message.guild.channels.cache.find(c => c.name === channelName);
+
+        if (!targetChannel) {
+            return message.reply(`Could not find channel #${channelName}.`);
+        }
+
+        await targetChannel.permissionOverwrites.delete(targetMember.id).catch(() => { });
+        return message.reply(`Revoked access for **${targetMember.displayName}** from **#${channelName}**.`);
     }
 
     // ----------------------------------------------------
@@ -702,6 +737,7 @@ client.on(Events.MessageCreate, async (message) => {
     const isAdmin = message.member.permissions.has(PermissionFlagsBits.Administrator);
     const isMod = message.member.roles.cache.has(modRole.id);
 
+    // Let mods and admins post messages without triggering review loops
     if (isMod && !isAdmin) {
         return;
     }
@@ -724,11 +760,10 @@ client.on(Events.MessageCreate, async (message) => {
         const arrayBuffer = await response.arrayBuffer();
         const rawBuffer = Buffer.from(arrayBuffer);
 
-        if (!isAdmin) {
-            await message.channel.permissionOverwrites.delete(submitter.id).catch(() => { });
-            submitter.send(`Your submission for Slot #${slotNumber} has been received and is waiting for moderator approval.`).catch(() => { });
-        }
+        // ACCESS RETAINED: We do NOT delete the submitter's channel permission overwrite here.
+        submitter.send(`Your submission for Slot #${slotNumber} has been received and is waiting for moderator approval. You retain channel access until it is accepted.`).catch(() => { });
 
+        // Ensure moderators can view and interact with the channel
         await message.channel.permissionOverwrites.edit(modRole.id, {
             ViewChannel: true,
             ReadMessageHistory: true,
@@ -741,38 +776,58 @@ client.on(Events.MessageCreate, async (message) => {
             .setColor('#f1c40f')
             .setDescription(`**Submitted By:** ${submitter.tag} (<@${submitter.id}>)\n\n**Proposed Blurb:**\n${blurbContent}`)
             .setImage(attachment.url)
-            .setFooter({ text: 'React with ✅ to approve or ❌ to reject.' })
+            .setFooter({ text: 'React ✅ to approve | React ❌ to reject' })
             .setTimestamp();
 
+        // Button to manually revoke slot permissions at any time during review
+        const revokeButtonRow = new ActionRowBuilder().addComponents(
+            new ButtonBuilder()
+                .setCustomId(`revoke_slot_perm:${slotNumber}:${submitter.id}`)
+                .setLabel('Remove Slot Permission')
+                .setStyle(ButtonStyle.Danger)
+                .setEmoji('🚫')
+        );
+
         const modPrompt = await message.channel.send({
-            content: `<@&${modRole.id}> A new image has been submitted for **Slot #${slotNumber}**. Please review and react below:`,
-            embeds: [approvalEmbed]
+            content: `<@&${modRole.id}> A new image has been submitted for **Slot #${slotNumber}**. Please review below:`,
+            embeds: [approvalEmbed],
+            components: [revokeButtonRow]
         });
 
         await modPrompt.react('✅');
         await modPrompt.react('❌');
 
+        // STRICT FILTER: Only Content Moderators and Administrators reactions count
         const collector = modPrompt.createReactionCollector({
-            filter: (reaction, user) => ['✅', '❌'].includes(reaction.emoji.name) && !user.bot,
+            filter: async (reaction, user) => {
+                if (user.bot) return false;
+                if (!['✅', '❌'].includes(reaction.emoji.name)) return false;
+
+                const member = await message.guild.members.fetch(user.id).catch(() => null);
+                if (!member) return false;
+
+                const isAuthorized = member.roles.cache.has(modRole.id) || member.permissions.has(PermissionFlagsBits.Administrator);
+                if (!isAuthorized) {
+                    // Instantly strip unauthorized user reactions
+                    await reaction.users.remove(user.id).catch(() => { });
+                    return false;
+                }
+                return true;
+            },
             time: 86400000 // 24 hours
         });
 
         collector.on('collect', async (reaction, user) => {
-            const member = await message.guild.members.fetch(user.id).catch(() => null);
-            if (!member) return;
-
-            const isAuthorized = member.roles.cache.has(modRole.id) || member.permissions.has(PermissionFlagsBits.Administrator);
-            if (!isAuthorized) {
-                await reaction.users.remove(user.id).catch(() => { });
-                return;
-            }
-
             collector.stop('handled');
 
             await message.delete().catch(() => { });
+            await modPrompt.delete().catch(() => { });
             await message.channel.permissionOverwrites.delete(modRole.id).catch(() => { });
 
             if (reaction.emoji.name === '✅') {
+                // ENTRY ACCEPTED: Revoke slot permission now
+                await message.channel.permissionOverwrites.delete(submitter.id).catch(() => { });
+
                 const statusMsg = await message.channel.send(`Approved by ${user.tag}. Converting to WebP and updating Slotblurbs.txt...`);
 
                 const webpBuffer = await sharp(rawBuffer)
@@ -815,11 +870,12 @@ client.on(Events.MessageCreate, async (message) => {
                     embeds: [buildPreviewEmbed(slotNumber, cloudinaryImageResult.version, currentSlotBlurb)]
                 });
 
-                submitter.send(`Your submission for Slot #${slotNumber} was approved and is now live on both Cloudinary and R2.`).catch(() => { });
+                submitter.send(`Your submission for Slot #${slotNumber} was accepted and is live. Your access to the slot channel has now ended.`).catch(() => { });
 
             } else if (reaction.emoji.name === '❌') {
+                // ENTRY REJECTED: User retains access to submit again
                 await message.channel.send(`Submission rejected by ${user.tag}. Resetting channel view...`);
-                submitter.send(`Your submission for Slot #${slotNumber} was rejected by a moderator.`).catch(() => { });
+                submitter.send(`Your submission for Slot #${slotNumber} was rejected by a moderator. You retain channel access to submit a revised image and blurb.`).catch(() => { });
 
                 await new Promise(resolve => setTimeout(resolve, 3000));
                 await renderSlotChannel(message.channel, slotNumber);
@@ -829,6 +885,7 @@ client.on(Events.MessageCreate, async (message) => {
         collector.on('end', async (collected, reason) => {
             if (reason === 'time') {
                 await message.delete().catch(() => { });
+                await modPrompt.delete().catch(() => { });
                 await message.channel.permissionOverwrites.delete(modRole.id).catch(() => { });
                 await message.channel.send(`Review for Slot #${slotNumber} timed out without a decision.`);
                 await renderSlotChannel(message.channel, slotNumber);
