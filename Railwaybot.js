@@ -67,8 +67,6 @@ const requiredEnvVars = [
     'CF_R2_ACCESS_KEY_ID',
     'CF_R2_SECRET_ACCESS_KEY',
     'CF_PUBLIC_DOMAIN'
-    // 'CF_ZONE_ID',   // Inactive for now
-    // 'CF_API_TOKEN'  // Inactive for now
 ];
 
 for (const envVar of requiredEnvVars) {
@@ -185,7 +183,6 @@ async function uploadToR2(body, key, contentType) {
 // Instantly purges the Cloudflare CDN edge cache (Inactive if credentials missing)
 async function purgeCloudflareUrls(urls) {
     if (!CF_ZONE_ID || !CF_API_TOKEN) {
-        // Silently skip cache purge while inactive
         return;
     }
 
@@ -399,14 +396,15 @@ function buildPreviewEmbed(slotNumber, version = null, blurbText = 'No text load
             `**Image URL (Cloudinary):**\n<${permImageUrl}>\n\n` +
             `**Image URL (R2):**\n<${CF_PUBLIC_DOMAIN}/Slot${slotNumber}.webp>\n\n` +
             `**Master Text (Slotblurbs.txt):**\n<${masterTextUrl}>\n\n` +
-            `Attach an image and type a message to update both simultaneously.`
+            `Attach an image and type a message to update both simultaneously.\n` +
+            `画像ファイルを添付し、メッセージを入力して同時に更新してください。`
         )
         .addFields({
-            name: `Live Blurb for Slot #${slotNumber}`,
+            name: `Live Blurb for Slot #${slotNumber} / 説明文`,
             value: blurbText.length > 1024 ? blurbText.slice(0, 1020) + '...' : blurbText
         })
         .setImage(displayUrl)
-        .setFooter({ text: 'Access is retained until your submission is accepted.' })
+        .setFooter({ text: 'Access is retained until accepted. / 承認されるまでアクセス権は保持されます。' })
         .setTimestamp();
 }
 
@@ -553,7 +551,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
         if (!isAuthorized) {
             return interaction.reply({
-                content: 'Only Content Moderators and Administrators can remove slot permissions.',
+                content: 'Only Content Moderators and Administrators can remove slot permissions. / 権限の解除はモデレーターまたは管理者のみ実行できます。',
                 ephemeral: true
             });
         }
@@ -561,15 +559,13 @@ client.on(Events.InteractionCreate, async (interaction) => {
         await interaction.channel.permissionOverwrites.delete(targetUserId).catch(() => { });
 
         const disabledRow = ActionRowBuilder.from(interaction.message.components[0]);
-        disabledRow.components[0].setDisabled(true).setLabel('Permission Revoked');
+        disabledRow.components[0].setDisabled(true).setLabel('Permission Revoked / 権限解除済み');
 
         await interaction.update({ components: [disabledRow] }).catch(() => { });
-        await interaction.channel.send(`🚫 **Slot permissions for <@${targetUserId}> were manually removed by <@${interaction.user.id}>.**`);
-
-        const targetMember = await interaction.guild.members.fetch(targetUserId).catch(() => null);
-        if (targetMember) {
-            targetMember.send(`Your access to **#slot-${slotNumber}** has been revoked.`).catch(() => { });
-        }
+        await interaction.channel.send(
+            `🚫 <@${targetUserId}> Your access to **#slot-${slotNumber}** has been removed by <@${interaction.user.id}>.\n` +
+            `このスロットへのアクセス権は <@${interaction.user.id}> によって解除されました。`
+        );
         return;
     }
 
@@ -697,8 +693,11 @@ client.on(Events.MessageCreate, async (message) => {
             AttachFiles: true
         });
 
-        message.reply(`Granted **${targetMember.displayName}** access to **#${channelName}**. (Access retained until accepted).`);
-        targetMember.send(`You have been given access to **#${channelName}**. Drop your image and blurb text there. Your access will remain active until your submission is accepted.`).catch(() => { });
+        message.reply(`Granted **${targetMember.displayName}** access to **#${channelName}**.`);
+        await targetChannel.send(
+            `<@${targetMember.id}> You have been granted access to this channel. Upload an image with an optional caption. Your access remains active until your submission is accepted.\n` +
+            `このチャンネルへのアクセス権が付与されました。画像と説明文（キャプション）を投稿してください。提出が承認されるまでアクセス権は保持されます。`
+        );
         return;
     }
 
@@ -727,7 +726,12 @@ client.on(Events.MessageCreate, async (message) => {
         }
 
         await targetChannel.permissionOverwrites.delete(targetMember.id).catch(() => { });
-        return message.reply(`Revoked access for **${targetMember.displayName}** from **#${channelName}**.`);
+        message.reply(`Revoked access for **${targetMember.displayName}** from **#${channelName}**.`);
+        await targetChannel.send(
+            `🚫 <@${targetMember.id}> Your access to this channel has been revoked by an administrator.\n` +
+            `管理者によってこのチャンネルへのアクセス権が解除されました。`
+        );
+        return;
     }
 
     // ----------------------------------------------------
@@ -749,8 +753,11 @@ client.on(Events.MessageCreate, async (message) => {
 
     if (!attachment || !attachment.contentType?.startsWith('image/')) {
         setTimeout(() => message.delete().catch(() => { }), 3000);
-        const warning = await message.channel.send('Please attach an image file (with optional blurb text in the caption).');
-        setTimeout(() => warning.delete().catch(() => { }), 3000);
+        const warning = await message.channel.send(
+            `<@${message.author.id}> Please attach an image file (with optional blurb text in the caption).\n` +
+            `画像ファイルを添付してください（キャプションに説明文を入力可能）。`
+        );
+        setTimeout(() => warning.delete().catch(() => { }), 4000);
         return;
     }
 
@@ -762,8 +769,6 @@ client.on(Events.MessageCreate, async (message) => {
         const arrayBuffer = await response.arrayBuffer();
         const rawBuffer = Buffer.from(arrayBuffer);
 
-        submitter.send(`Your submission for Slot #${slotNumber} has been received and is waiting for moderator approval. You retain channel access until it is accepted.`).catch(() => { });
-
         await message.channel.permissionOverwrites.edit(modRole.id, {
             ViewChannel: true,
             ReadMessageHistory: true,
@@ -772,23 +777,29 @@ client.on(Events.MessageCreate, async (message) => {
         });
 
         const approvalEmbed = new EmbedBuilder()
-            .setTitle(`Review Required: Slot #${slotNumber}`)
+            .setTitle(`Review Required: Slot #${slotNumber} / 承認待ち`)
             .setColor('#f1c40f')
-            .setDescription(`**Submitted By:** ${submitter.tag} (<@${submitter.id}>)\n\n**Proposed Blurb:**\n${blurbContent}`)
+            .setDescription(
+                `**Submitted By / 投稿者:** ${submitter.tag} (<@${submitter.id}>)\n\n` +
+                `**Proposed Blurb / 提案された説明文:**\n${blurbContent}`
+            )
             .setImage(attachment.url)
-            .setFooter({ text: 'React ✅ to approve | React ❌ to reject' })
+            .setFooter({ text: 'React ✅ to approve | React ❌ to reject\n承認は ✅ | 却下は ❌' })
             .setTimestamp();
 
         const revokeButtonRow = new ActionRowBuilder().addComponents(
             new ButtonBuilder()
                 .setCustomId(`revoke_slot_perm:${slotNumber}:${submitter.id}`)
-                .setLabel('Remove Slot Permission')
+                .setLabel('Remove Slot Permission / 権限解除')
                 .setStyle(ButtonStyle.Danger)
                 .setEmoji('🚫')
         );
 
         const modPrompt = await message.channel.send({
-            content: `<@&${modRole.id}> A new image has been submitted for **Slot #${slotNumber}**. Please review below:`,
+            content:
+                `<@&${modRole.id}> A new image has been submitted for **Slot #${slotNumber}** by <@${submitter.id}>.\n` +
+                `<@${submitter.id}> Your submission is pending moderator approval. You retain channel access until it is accepted.\n` +
+                `**Slot #${slotNumber}** に新しい画像が投稿されました。承認待ちです（承認されるまでアクセス権は保持されます）。`,
             embeds: [approvalEmbed],
             components: [revokeButtonRow]
         });
@@ -824,7 +835,10 @@ client.on(Events.MessageCreate, async (message) => {
             if (reaction.emoji.name === '✅') {
                 await message.channel.permissionOverwrites.delete(submitter.id).catch(() => { });
 
-                const statusMsg = await message.channel.send(`Approved by ${user.tag}. Converting to WebP and updating Slotblurbs.txt...`);
+                const statusMsg = await message.channel.send(
+                    `Approved by ${user.tag}. Converting to WebP and updating Slotblurbs.txt...\n` +
+                    `${user.tag} によって承認されました。WebPへの変換と Slotblurbs.txt の更新中...`
+                );
 
                 const webpBuffer = await sharp(rawBuffer)
                     .resize(2048, 2048, { fit: 'inside', withoutEnlargement: true })
@@ -852,7 +866,10 @@ client.on(Events.MessageCreate, async (message) => {
                     `${CF_PUBLIC_DOMAIN}/LastUpdate.txt`
                 ]);
 
-                await statusMsg.edit('Uploaded. Waiting 30 seconds for Cloudinary CDN propagation...');
+                await statusMsg.edit(
+                    'Uploaded. Waiting 30 seconds for Cloudinary CDN propagation...\n' +
+                    'アップロード完了。CDNの反映を30秒間待機しています...'
+                );
                 await new Promise(resolve => setTimeout(resolve, 30000));
 
                 const currentSlotBlurb = await fetchSingleBlurb(slotNumber);
@@ -866,11 +883,20 @@ client.on(Events.MessageCreate, async (message) => {
                     embeds: [buildPreviewEmbed(slotNumber, cloudinaryImageResult.version, currentSlotBlurb)]
                 });
 
-                submitter.send(`Your submission for Slot #${slotNumber} was accepted and is live. Your access to the slot channel has now ended.`).catch(() => { });
+                await message.channel.send(
+                    `<@${submitter.id}> Your submission for **Slot #${slotNumber}** was accepted and is live. Your access to this slot channel has ended.\n` +
+                    `スロット #${slotNumber} への投稿が承認され、公開されました。このスロットへのアクセス権は終了しました。`
+                );
 
             } else if (reaction.emoji.name === '❌') {
-                await message.channel.send(`Submission rejected by ${user.tag}. Resetting channel view...`);
-                submitter.send(`Your submission for Slot #${slotNumber} was rejected by a moderator. You retain channel access to submit a revised image and blurb.`).catch(() => { });
+                await message.channel.send(
+                    `Submission rejected by ${user.tag}. Resetting channel view...\n` +
+                    `${user.tag} によって却下されました。チャンネル表示をリセットしています...`
+                );
+                await message.channel.send(
+                    `<@${submitter.id}> Your submission for **Slot #${slotNumber}** was rejected. You retain channel access to submit a revised image and blurb.\n` +
+                    `スロット #${slotNumber} への投稿は却下されました。修正した画像と説明文を再度投稿してください。`
+                );
 
                 await new Promise(resolve => setTimeout(resolve, 3000));
                 await renderSlotChannel(message.channel, slotNumber);
@@ -882,7 +908,10 @@ client.on(Events.MessageCreate, async (message) => {
                 await message.delete().catch(() => { });
                 await modPrompt.delete().catch(() => { });
                 await message.channel.permissionOverwrites.delete(modRole.id).catch(() => { });
-                await message.channel.send(`Review for Slot #${slotNumber} timed out without a decision.`);
+                await message.channel.send(
+                    `Review for Slot #${slotNumber} timed out without a decision.\n` +
+                    `スロット #${slotNumber} の確認期限が切れました。`
+                );
                 await renderSlotChannel(message.channel, slotNumber);
             }
         });
