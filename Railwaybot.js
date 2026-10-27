@@ -1,4 +1,4 @@
-﻿require('dotenv').config();
+require('dotenv').config();
 
 const {
     Client,
@@ -87,7 +87,7 @@ const r2Client = new S3Client({
     }
 });
 
-// Initialize Discord Client (with Partials for reaction tracking)
+// Initialize Discord Client (with Partials for uncached reaction tracking)
 const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
@@ -346,7 +346,7 @@ function parseBlurbsFile(rawText) {
 function formatBlurbsFile(blurbsMap) {
     const sections = [];
     for (let i = 1; i <= 16; i++) {
-        const content = blurMap = blurbsMap[i] || 'No description provided.';
+        const content = blurbsMap[i] || 'No description provided.';
         sections.push(`=== [SLOT ${i}] ===\n${content}`);
     }
     return sections.join('\n\n') + '\n';
@@ -457,26 +457,40 @@ async function setupChannels(guild) {
         }
     ];
 
-    let category = guild.channels.cache.find(
+    // --- Category: IMAGE SLOTS ---
+    let slotsCategory = guild.channels.cache.find(
         c => c.name.toLowerCase() === 'image slots' && c.type === ChannelType.GuildCategory
     );
 
-    if (!category) {
-        category = await guild.channels.create({
+    if (!slotsCategory) {
+        slotsCategory = await guild.channels.create({
             name: 'IMAGE SLOTS',
             type: ChannelType.GuildCategory,
             permissionOverwrites: basePermissions
         });
     }
 
-    // --- Submissions Channel Setup ---
+    // --- Category: AUTOMATION ---
+    let automationCategory = guild.channels.cache.find(
+        c => c.name.toLowerCase() === 'automation' && c.type === ChannelType.GuildCategory
+    );
+
+    if (!automationCategory) {
+        automationCategory = await guild.channels.create({
+            name: 'AUTOMATION',
+            type: ChannelType.GuildCategory,
+            permissionOverwrites: basePermissions
+        });
+    }
+
+    // --- Submissions Channel Setup (under AUTOMATION) ---
     let submissionsChannel = guild.channels.cache.find(c => c.name === 'submissions');
     if (!submissionsChannel) {
         submissionsChannel = await guild.channels.create({
             name: 'submissions',
             type: ChannelType.GuildText,
-            parent: category.id,
-            rateLimitPerUser: 21600, // Native 6-hour rate limit limit fallback
+            parent: automationCategory.id,
+            rateLimitPerUser: 21600,
             permissionOverwrites: [
                 {
                     id: guild.roles.everyone.id,
@@ -519,46 +533,18 @@ async function setupChannels(guild) {
             ],
             topic: 'Submit an image and exactly 3 lines of text.'
         });
-        console.log('Created #submissions channel');
+        console.log('Created #submissions channel in AUTOMATION');
+    } else if (submissionsChannel.parentId !== automationCategory.id) {
+        await submissionsChannel.setParent(automationCategory.id, { lockPermissions: false });
     }
 
-    // --- Slot Channels Setup ---
-    for (let i = 1; i <= 16; i++) {
-        const channelName = `slot-${i}`;
-        let channel = guild.channels.cache.find(
-            c => c.name === channelName && c.parentId === category.id
-        );
-
-        if (!channel) {
-            channel = await guild.channels.create({
-                name: channelName,
-                type: ChannelType.GuildText,
-                parent: category.id,
-                permissionOverwrites: basePermissions,
-                topic: `Upload an image + caption here to update Slot #${i}`
-            });
-            console.log(`Created private channel #${channelName}`);
-        }
-
-        const messages = await channel.messages.fetch({ limit: 10 });
-        const botMessage = messages.find(m => m.author.id === client.user.id);
-
-        if (!botMessage) {
-            const currentBlurb = await fetchSingleBlurb(i);
-            await channel.send({ embeds: [buildPreviewEmbed(i, null, currentBlurb)] });
-        }
-    }
-
-    // --- Light Switches Channel Setup ---
-    let lightsChannel = guild.channels.cache.find(
-        c => c.name === 'light-switches' && c.parentId === category.id
-    );
-
+    // --- Light Switches Channel Setup (under AUTOMATION) ---
+    let lightsChannel = guild.channels.cache.find(c => c.name === 'light-switches');
     if (!lightsChannel) {
         lightsChannel = await guild.channels.create({
             name: 'light-switches',
             type: ChannelType.GuildText,
-            parent: category.id,
+            parent: automationCategory.id,
             permissionOverwrites: [
                 {
                     id: guild.roles.everyone.id,
@@ -577,7 +563,36 @@ async function setupChannels(guild) {
             ],
             topic: 'Controls for Lights.txt switches'
         });
-        console.log('Created #light-switches channel');
+        console.log('Created #light-switches channel in AUTOMATION');
+    } else if (lightsChannel.parentId !== automationCategory.id) {
+        await lightsChannel.setParent(automationCategory.id, { lockPermissions: false });
+    }
+
+    // --- Slot Channels Setup (under IMAGE SLOTS) ---
+    for (let i = 1; i <= 16; i++) {
+        const channelName = `slot-${i}`;
+        let channel = guild.channels.cache.find(
+            c => c.name === channelName && c.parentId === slotsCategory.id
+        );
+
+        if (!channel) {
+            channel = await guild.channels.create({
+                name: channelName,
+                type: ChannelType.GuildText,
+                parent: slotsCategory.id,
+                permissionOverwrites: basePermissions,
+                topic: `Upload an image + caption here to update Slot #${i}`
+            });
+            console.log(`Created private channel #${channelName}`);
+        }
+
+        const messages = await channel.messages.fetch({ limit: 10 });
+        const botMessage = messages.find(m => m.author.id === client.user.id);
+
+        if (!botMessage) {
+            const currentBlurb = await fetchSingleBlurb(i);
+            await channel.send({ embeds: [buildPreviewEmbed(i, null, currentBlurb)] });
+        }
     }
 
     await renderLightSwitchesChannel(lightsChannel, switchesState);
@@ -663,7 +678,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
 });
 
-// Listener: Reaction Added (Moderator deletion, Admin ban)
+// Listener: Reaction Added (Voting verification, Moderator deletion, Admin ban)
 client.on(Events.MessageReactionAdd, async (reaction, user) => {
     if (user.bot) return;
 
@@ -683,8 +698,18 @@ client.on(Events.MessageReactionAdd, async (reaction, user) => {
     if (!member) return;
 
     const modRole = await getOrCreateModeratorRole(guild);
+    const votersRole = await getOrCreateVotersRole(guild);
     const isAdmin = member.permissions.has(PermissionFlagsBits.Administrator);
     const isMod = member.roles.cache.has(modRole.id);
+    const isVoter = member.roles.cache.has(votersRole.id);
+
+    // Vote Reaction: Strictly restricted to users with the Voters role
+    if (reaction.emoji.name === '⬆️' || reaction.emoji.name === '⬇️') {
+        if (!isVoter) {
+            await reaction.users.remove(user.id).catch(() => { });
+        }
+        return;
+    }
 
     // Trash Can Reaction: Delete submission (Content Moderators & Admins)
     if (reaction.emoji.name === '🗑️') {
@@ -737,9 +762,10 @@ client.on(Events.MessageCreate, async (message) => {
     if (message.channel.name === 'submissions') {
         const now = Date.now();
         const lastSubmit = submissionCooldowns.get(message.author.id);
+        const isAdmin = message.member.permissions.has(PermissionFlagsBits.Administrator);
 
-        // 3-Day Slowmode Enforcement
-        if (lastSubmit && (now - lastSubmit < THREE_DAYS_MS)) {
+        // 3-Day Slowmode Enforcement (bypassed for Administrators)
+        if (!isAdmin && lastSubmit && (now - lastSubmit < THREE_DAYS_MS)) {
             const remainingHours = Math.ceil((THREE_DAYS_MS - (now - lastSubmit)) / (1000 * 60 * 60));
             await message.delete().catch(() => { });
 
@@ -769,8 +795,10 @@ client.on(Events.MessageCreate, async (message) => {
             return;
         }
 
-        // Valid submission: update cooldown and apply reaction hooks
-        submissionCooldowns.set(message.author.id, now);
+        // Valid submission: update cooldown (if not admin) and apply reactions
+        if (!isAdmin) {
+            submissionCooldowns.set(message.author.id, now);
+        }
 
         try {
             await message.react('⬆️');
