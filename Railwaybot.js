@@ -94,7 +94,7 @@ const r2Client = new S3Client({
     }
 });
 
-// Initialize Discord Client (with Partials for uncached reaction tracking)
+// Initialize Discord Client
 const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
@@ -105,9 +105,10 @@ const client = new Client({
     partials: [Partials.Message, Partials.Channel, Partials.Reaction]
 });
 
-// Submission cooldown tracker (3 days per user)
+// Cooldown and Scan Trackers
 const submissionCooldowns = new Map();
 const THREE_DAYS_MS = 3 * 24 * 60 * 60 * 1000;
+const scannedAiSubmissions = new Set();
 
 // In-memory switches state cache
 let switchesState = [
@@ -224,7 +225,6 @@ async function purgeCloudflareUrls(urls) {
     }
 }
 
-// Check an image using Sightengine AI
 async function querySightengine(imageUrl) {
     const endpoint = new URL('https://api.sightengine.com/1.0/check.json');
     endpoint.searchParams.append('models', SIGHTENGINE_MODELS);
@@ -654,6 +654,43 @@ async function setupChannels(guild) {
         await lightsChannel.setParent(automationCategory.id, { lockPermissions: false });
     }
 
+    // --- AI Logs Channel Setup (under AUTOMATION) ---
+    let aiLogsChannel = guild.channels.cache.find(c => c.name === 'ai-logs');
+    if (!aiLogsChannel) {
+        aiLogsChannel = await guild.channels.create({
+            name: 'ai-logs',
+            type: ChannelType.GuildText,
+            parent: automationCategory.id,
+            permissionOverwrites: [
+                {
+                    id: guild.roles.everyone.id,
+                    deny: [PermissionFlagsBits.ViewChannel]
+                },
+                {
+                    id: modRole.id,
+                    allow: [
+                        PermissionFlagsBits.ViewChannel,
+                        PermissionFlagsBits.ReadMessageHistory
+                    ]
+                },
+                {
+                    id: client.user.id,
+                    allow: [
+                        PermissionFlagsBits.ViewChannel,
+                        PermissionFlagsBits.SendMessages,
+                        PermissionFlagsBits.AttachFiles,
+                        PermissionFlagsBits.EmbedLinks,
+                        PermissionFlagsBits.ReadMessageHistory
+                    ]
+                }
+            ],
+            topic: 'Logs for Sightengine AI image analysis.'
+        });
+        console.log('Created #ai-logs channel in AUTOMATION');
+    } else if (aiLogsChannel.parentId !== automationCategory.id) {
+        await aiLogsChannel.setParent(automationCategory.id, { lockPermissions: false });
+    }
+
     // --- Slot Channels Setup (under IMAGE SLOTS) ---
     for (let i = 1; i <= 16; i++) {
         const channelName = `slot-${i}`;
@@ -809,8 +846,13 @@ client.on(Events.MessageReactionAdd, async (reaction, user) => {
 
     // Robot Reaction: Sightengine AI Image Detection Check
     if (reaction.emoji.name === '🤖') {
-        // Moderator or Admin only
         if (!isMod && !isAdmin) {
+            await reaction.users.remove(user.id).catch(() => { });
+            return;
+        }
+
+        // Prevent repeated detections
+        if (scannedAiSubmissions.has(message.id)) {
             await reaction.users.remove(user.id).catch(() => { });
             return;
         }
@@ -821,28 +863,39 @@ client.on(Events.MessageReactionAdd, async (reaction, user) => {
             return;
         }
 
-        try {
-            const result = await querySightengine(attachment.url);
-            const formattedJson = JSON.stringify(result, null, 2);
+        // Mark as scanned
+        scannedAiSubmissions.add(message.id);
 
-            if (formattedJson.length <= 1900) {
-                await message.reply({
-                    content: `Sightengine Analysis Result (${SIGHTENGINE_MODELS}):\n\`\`\`json\n${formattedJson}\n\`\`\``
-                });
-            } else {
-                await message.reply({
-                    content: `Sightengine Analysis Result (${SIGHTENGINE_MODELS}):`,
+        try {
+            // Remove the robot reactions so it cannot be re-triggered
+            await message.reactions.cache.get('🤖')?.remove().catch(() => { });
+
+            // Query Sightengine
+            const result = await querySightengine(attachment.url);
+            const aiScore = result.type?.ai_generated;
+            const percentStr = (aiScore !== undefined) ? `${(aiScore * 100).toFixed(1)}%` : 'unknown%';
+            const dateStr = new Date().toISOString().replace('T', ' ').substring(0, 19) + ' UTC';
+
+            // Download original image for re-upload
+            const imageResponse = await fetch(attachment.url);
+            const imageArrayBuffer = await imageResponse.arrayBuffer();
+            const imageBuffer = Buffer.from(imageArrayBuffer);
+            const fileName = attachment.name || 'submission.png';
+
+            // Send report to #ai-logs
+            const aiLogsChannel = guild.channels.cache.find(c => c.name === 'ai-logs');
+            if (aiLogsChannel) {
+                await aiLogsChannel.send({
+                    content: `${message.author.tag} submission at ${percentStr} certainty of AI generation on ${dateStr}`,
                     files: [{
-                        attachment: Buffer.from(formattedJson, 'utf-8'),
-                        name: 'sightengine_result.json'
+                        attachment: imageBuffer,
+                        name: fileName
                     }]
                 });
             }
         } catch (err) {
             console.error('Sightengine Analysis Error:', err);
-            await message.reply(`Sightengine Analysis Failed: ${err?.message || err}`);
-        } finally {
-            await reaction.users.remove(user.id).catch(() => { });
+            scannedAiSubmissions.delete(message.id);
         }
     }
 });
