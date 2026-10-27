@@ -9,7 +9,8 @@ const {
     ActionRowBuilder,
     ButtonBuilder,
     ButtonStyle,
-    Events
+    Events,
+    Partials
 } = require('discord.js');
 const cloudinary = require('cloudinary').v2;
 const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
@@ -86,15 +87,20 @@ const r2Client = new S3Client({
     }
 });
 
-// Initialize Discord Client
+// Initialize Discord Client (with Partials for reaction tracking)
 const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
         GatewayIntentBits.GuildMessages,
         GatewayIntentBits.MessageContent,
         GatewayIntentBits.GuildMessageReactions
-    ]
+    ],
+    partials: [Partials.Message, Partials.Channel, Partials.Reaction]
 });
+
+// Submission cooldown tracker (3 days per user)
+const submissionCooldowns = new Map();
+const THREE_DAYS_MS = 3 * 24 * 60 * 60 * 1000;
 
 // In-memory switches state cache
 let switchesState = [
@@ -107,7 +113,6 @@ let switchesState = [
 // 2. HELPER FUNCTIONS (SLOTS & STORAGE)
 // ==========================================
 
-// Ensures the Content Moderator role exists
 async function getOrCreateModeratorRole(guild) {
     let role = guild.roles.cache.find(r => r.name.toLowerCase() === 'content moderator');
     if (!role) {
@@ -120,17 +125,26 @@ async function getOrCreateModeratorRole(guild) {
     return role;
 }
 
-// Returns the permanent public image URL (Cloudinary)
+async function getOrCreateVotersRole(guild) {
+    let role = guild.roles.cache.find(r => r.name.toLowerCase() === 'voters');
+    if (!role) {
+        role = await guild.roles.create({
+            name: 'Voters',
+            reason: 'Role required for viewing submission history and voting'
+        });
+        console.log(`Created Voters role in ${guild.name}`);
+    }
+    return role;
+}
+
 function getPermanentImageUrl(slotNumber) {
     return `https://res.cloudinary.com/${CLOUD_NAME}/image/upload/c_limit,w_2048,h_2048/Slot${slotNumber}.webp`;
 }
 
-// Returns the permanent public text URL for the master blurbs file
 function getPermanentBlurbsUrl() {
     return `https://res.cloudinary.com/${CLOUD_NAME}/raw/upload/Slotblurbs.txt`;
 }
 
-// Streams text directly to Cloudinary memory
 function uploadTextStream(text, publicId) {
     return new Promise((resolve, reject) => {
         const stream = cloudinary.uploader.upload_stream(
@@ -149,7 +163,6 @@ function uploadTextStream(text, publicId) {
     });
 }
 
-// Streams image buffer to Cloudinary
 function uploadImageStream(buffer, publicId) {
     return new Promise((resolve, reject) => {
         const stream = cloudinary.uploader.upload_stream(
@@ -168,7 +181,6 @@ function uploadImageStream(buffer, publicId) {
     });
 }
 
-// Uploads buffers or strings to Cloudflare R2
 async function uploadToR2(body, key, contentType) {
     const command = new PutObjectCommand({
         Bucket: CF_R2_BUCKET_NAME,
@@ -180,7 +192,6 @@ async function uploadToR2(body, key, contentType) {
     return r2Client.send(command);
 }
 
-// Instantly purges the Cloudflare CDN edge cache (Inactive if credentials missing)
 async function purgeCloudflareUrls(urls) {
     if (!CF_ZONE_ID || !CF_API_TOKEN) {
         return;
@@ -335,7 +346,7 @@ function parseBlurbsFile(rawText) {
 function formatBlurbsFile(blurbsMap) {
     const sections = [];
     for (let i = 1; i <= 16; i++) {
-        const content = blurbsMap[i] || 'No description provided.';
+        const content = blurMap = blurbsMap[i] || 'No description provided.';
         sections.push(`=== [SLOT ${i}] ===\n${content}`);
     }
     return sections.join('\n\n') + '\n';
@@ -423,7 +434,8 @@ async function renderSlotChannel(channel, slotNumber) {
 
 async function setupChannels(guild) {
     console.log(`Setting up channels for guild: ${guild.name}...`);
-    await getOrCreateModeratorRole(guild);
+    const modRole = await getOrCreateModeratorRole(guild);
+    const votersRole = await getOrCreateVotersRole(guild);
 
     const basePermissions = [
         {
@@ -457,6 +469,60 @@ async function setupChannels(guild) {
         });
     }
 
+    // --- Submissions Channel Setup ---
+    let submissionsChannel = guild.channels.cache.find(c => c.name === 'submissions');
+    if (!submissionsChannel) {
+        submissionsChannel = await guild.channels.create({
+            name: 'submissions',
+            type: ChannelType.GuildText,
+            parent: category.id,
+            rateLimitPerUser: 21600, // Native 6-hour rate limit limit fallback
+            permissionOverwrites: [
+                {
+                    id: guild.roles.everyone.id,
+                    allow: [
+                        PermissionFlagsBits.ViewChannel,
+                        PermissionFlagsBits.SendMessages,
+                        PermissionFlagsBits.AttachFiles
+                    ],
+                    deny: [
+                        PermissionFlagsBits.ReadMessageHistory
+                    ]
+                },
+                {
+                    id: modRole.id,
+                    allow: [
+                        PermissionFlagsBits.ViewChannel,
+                        PermissionFlagsBits.ReadMessageHistory,
+                        PermissionFlagsBits.SendMessages,
+                        PermissionFlagsBits.AddReactions
+                    ]
+                },
+                {
+                    id: votersRole.id,
+                    allow: [
+                        PermissionFlagsBits.ViewChannel,
+                        PermissionFlagsBits.ReadMessageHistory,
+                        PermissionFlagsBits.AddReactions
+                    ]
+                },
+                {
+                    id: client.user.id,
+                    allow: [
+                        PermissionFlagsBits.ViewChannel,
+                        PermissionFlagsBits.SendMessages,
+                        PermissionFlagsBits.ManageMessages,
+                        PermissionFlagsBits.ReadMessageHistory,
+                        PermissionFlagsBits.AddReactions
+                    ]
+                }
+            ],
+            topic: 'Submit an image and exactly 3 lines of text.'
+        });
+        console.log('Created #submissions channel');
+    }
+
+    // --- Slot Channels Setup ---
     for (let i = 1; i <= 16; i++) {
         const channelName = `slot-${i}`;
         let channel = guild.channels.cache.find(
@@ -483,6 +549,7 @@ async function setupChannels(guild) {
         }
     }
 
+    // --- Light Switches Channel Setup ---
     let lightsChannel = guild.channels.cache.find(
         c => c.name === 'light-switches' && c.parentId === category.id
     );
@@ -541,7 +608,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     const { customId } = interaction;
 
-    // --- BUTTON: Remove Slot Permission ---
+    // Button: Remove Slot Permission
     if (customId.startsWith('revoke_slot_perm:')) {
         const [, slotNumber, targetUserId] = customId.split(':');
         const modRole = await getOrCreateModeratorRole(interaction.guild);
@@ -563,13 +630,13 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
         await interaction.update({ components: [disabledRow] }).catch(() => { });
         await interaction.channel.send(
-            `🚫 <@${targetUserId}> Your access to **#slot-${slotNumber}** has been removed by <@${interaction.user.id}>.\n` +
+            `<@${targetUserId}> Your access to **#slot-${slotNumber}** has been removed by <@${interaction.user.id}>.\n` +
             `このスロットへのアクセス権は <@${interaction.user.id}> によって解除されました。`
         );
         return;
     }
 
-    // --- BUTTONS: Light Switches ---
+    // Buttons: Light Switches
     if (customId.startsWith('light_on_') || customId.startsWith('light_off_')) {
         const isTurningOn = customId.startsWith('light_on_');
         const switchId = parseInt(customId.replace(isTurningOn ? 'light_on_' : 'light_off_', ''), 10);
@@ -596,8 +663,125 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
 });
 
+// Listener: Reaction Added (Moderator deletion, Admin ban)
+client.on(Events.MessageReactionAdd, async (reaction, user) => {
+    if (user.bot) return;
+
+    if (reaction.partial) {
+        try {
+            await reaction.fetch();
+        } catch (err) {
+            return;
+        }
+    }
+
+    const { message } = reaction;
+    if (message.channel.name !== 'submissions') return;
+
+    const guild = message.guild;
+    const member = await guild.members.fetch(user.id).catch(() => null);
+    if (!member) return;
+
+    const modRole = await getOrCreateModeratorRole(guild);
+    const isAdmin = member.permissions.has(PermissionFlagsBits.Administrator);
+    const isMod = member.roles.cache.has(modRole.id);
+
+    // Trash Can Reaction: Delete submission (Content Moderators & Admins)
+    if (reaction.emoji.name === '🗑️') {
+        if (isMod || isAdmin) {
+            await message.delete().catch(() => { });
+        } else {
+            await reaction.users.remove(user.id).catch(() => { });
+        }
+        return;
+    }
+
+    // Robot Reaction: Admin-only Ban confirmation
+    if (reaction.emoji.name === '🤖') {
+        if (!isAdmin) {
+            await reaction.users.remove(user.id).catch(() => { });
+            return;
+        }
+
+        const brickReaction = await message.react('🧱').catch(() => null);
+        if (!brickReaction) return;
+
+        const filter = (r, u) => r.emoji.name === '🧱' && u.id === user.id;
+        const collector = message.createReactionCollector({ filter, time: 10000, max: 1 });
+
+        collector.on('collect', async () => {
+            const targetAuthor = message.author;
+            if (targetAuthor) {
+                await guild.members.ban(targetAuthor.id, {
+                    reason: `Submission banned by administrator ${user.tag}`
+                }).catch(err => console.error('Ban error:', err));
+
+                await message.delete().catch(() => { });
+            }
+        });
+
+        collector.on('end', async (collected) => {
+            if (collected.size === 0) {
+                await message.reactions.cache.get('🧱')?.remove().catch(() => { });
+            }
+        });
+    }
+});
+
 client.on(Events.MessageCreate, async (message) => {
     if (message.author.bot) return;
+
+    // ----------------------------------------------------
+    // SUBMISSIONS CHANNEL HANDLER
+    // ----------------------------------------------------
+    if (message.channel.name === 'submissions') {
+        const now = Date.now();
+        const lastSubmit = submissionCooldowns.get(message.author.id);
+
+        // 3-Day Slowmode Enforcement
+        if (lastSubmit && (now - lastSubmit < THREE_DAYS_MS)) {
+            const remainingHours = Math.ceil((THREE_DAYS_MS - (now - lastSubmit)) / (1000 * 60 * 60));
+            await message.delete().catch(() => { });
+
+            const warning = await message.channel.send(
+                `<@${message.author.id}>\n` +
+                `You may only post once every 3 days. Please wait ${remainingHours} more hour(s).\n` +
+                `投稿は3日に1度のみ可能です。あと ${remainingHours} 時間お待ちください。`
+            );
+            setTimeout(() => warning.delete().catch(() => { }), 6000);
+            return;
+        }
+
+        const attachment = message.attachments.first();
+        const isImage = attachment && attachment.contentType?.startsWith('image/');
+        const lines = message.content.trim().split(/\r?\n/).filter(line => line.trim().length > 0);
+
+        // Format validation: Image + exactly 3 lines of text
+        if (!isImage || lines.length !== 3) {
+            await message.delete().catch(() => { });
+
+            const explanation = await message.channel.send(
+                `<@${message.author.id}>\n` +
+                `Submission rejected. Your post must include an image file and exactly 3 lines of text.\n` +
+                `投稿が取り消されました。画像ファイルを1点添付し、テキストを正確に3行入力してください。`
+            );
+            setTimeout(() => explanation.delete().catch(() => { }), 7000);
+            return;
+        }
+
+        // Valid submission: update cooldown and apply reaction hooks
+        submissionCooldowns.set(message.author.id, now);
+
+        try {
+            await message.react('⬆️');
+            await message.react('⬇️');
+            await message.react('🗑️');
+            await message.react('🤖');
+        } catch (err) {
+            console.error('Error adding reactions to submission:', err);
+        }
+        return;
+    }
 
     // ----------------------------------------------------
     // COMMAND: !addswitch [optional description]
@@ -728,7 +912,7 @@ client.on(Events.MessageCreate, async (message) => {
         await targetChannel.permissionOverwrites.delete(targetMember.id).catch(() => { });
         message.reply(`Revoked access for **${targetMember.displayName}** from **#${channelName}**.`);
         await targetChannel.send(
-            `🚫 <@${targetMember.id}> Your access to this channel has been revoked by an administrator.\n` +
+            `<@${targetMember.id}> Your access to this channel has been revoked by an administrator.\n` +
             `管理者によってこのチャンネルへのアクセス権が解除されました。`
         );
         return;
@@ -792,7 +976,6 @@ client.on(Events.MessageCreate, async (message) => {
                 .setCustomId(`revoke_slot_perm:${slotNumber}:${submitter.id}`)
                 .setLabel('Remove Slot Permission / 権限解除')
                 .setStyle(ButtonStyle.Danger)
-                .setEmoji('🚫')
         );
 
         const modPrompt = await message.channel.send({
