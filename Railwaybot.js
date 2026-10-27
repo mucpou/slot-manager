@@ -58,6 +58,11 @@ const CF_PUBLIC_DOMAIN = process.env.CF_PUBLIC_DOMAIN;
 const CF_ZONE_ID = process.env.CF_ZONE_ID || null;
 const CF_API_TOKEN = process.env.CF_API_TOKEN || null;
 
+// Sightengine AI Moderation Configuration
+const SIGHTENGINE_API_USER = process.env.SIGHTENGINE_API_USER;
+const SIGHTENGINE_API_SECRET = process.env.SIGHTENGINE_API_SECRET;
+const SIGHTENGINE_MODELS = process.env.SIGHTENGINE_MODELS || 'genai';
+
 // Validate that required variables are present
 const requiredEnvVars = [
     'DISCORD_BOT_TOKEN',
@@ -67,7 +72,9 @@ const requiredEnvVars = [
     'CF_ACCOUNT_ID',
     'CF_R2_ACCESS_KEY_ID',
     'CF_R2_SECRET_ACCESS_KEY',
-    'CF_PUBLIC_DOMAIN'
+    'CF_PUBLIC_DOMAIN',
+    'SIGHTENGINE_API_USER',
+    'SIGHTENGINE_API_SECRET'
 ];
 
 for (const envVar of requiredEnvVars) {
@@ -215,6 +222,18 @@ async function purgeCloudflareUrls(urls) {
     } catch (err) {
         console.error('Error contacting Cloudflare Purge API:', err);
     }
+}
+
+// Check an image using Sightengine AI
+async function querySightengine(imageUrl) {
+    const endpoint = new URL('https://api.sightengine.com/1.0/check.json');
+    endpoint.searchParams.append('models', SIGHTENGINE_MODELS);
+    endpoint.searchParams.append('api_user', SIGHTENGINE_API_USER);
+    endpoint.searchParams.append('api_secret', SIGHTENGINE_API_SECRET);
+    endpoint.searchParams.append('url', imageUrl);
+
+    const response = await fetch(endpoint.toString());
+    return await response.json();
 }
 
 // ==========================================
@@ -426,6 +445,73 @@ async function renderSlotChannel(channel, slotNumber) {
     }
     const currentBlurb = await fetchSingleBlurb(slotNumber);
     await channel.send({ embeds: [buildPreviewEmbed(slotNumber, null, currentBlurb)] });
+}
+
+// ==========================================
+// UNIFIED PIPELINE FOR DEPLOYING SLOT UPDATES
+// ==========================================
+
+async function deploySlotUpdate({ guild, slotNumber, rawImageBuffer, blurbContent, submitter, approverUser, feedbackChannel }) {
+    const statusMsg = await feedbackChannel.send(
+        `Approved by ${approverUser.tag}. Converting to WebP and updating slot #${slotNumber}...\n` +
+        `${approverUser.tag} によって承認されました。WebPへの変換とスロット #${slotNumber} を更新中...`
+    );
+
+    const webpBuffer = await sharp(rawImageBuffer)
+        .resize(2048, 2048, { fit: 'inside', withoutEnlargement: true })
+        .webp({ quality: 95 })
+        .toBuffer();
+
+    const imageFileName = `Slot${slotNumber}.webp`;
+    const updatedMasterBlurbs = await updateMasterBlurbs(slotNumber, blurbContent);
+    const lastUpdateContent = generateLastUpdateContent(slotNumber, blurbContent);
+
+    const [cloudinaryImageResult] = await Promise.all([
+        uploadImageStream(webpBuffer, `Slot${slotNumber}`),
+        uploadTextStream(updatedMasterBlurbs, 'Slotblurbs.txt'),
+        uploadTextStream(lastUpdateContent, 'LastUpdate.txt'),
+
+        uploadToR2(webpBuffer, imageFileName, 'image/webp'),
+        uploadToR2(Buffer.from(updatedMasterBlurbs, 'utf-8'), 'Slotblurbs.txt', 'text/plain; charset=utf-8'),
+        uploadToR2(Buffer.from(lastUpdateContent, 'utf-8'), 'LastUpdate.txt', 'text/plain; charset=utf-8')
+    ]);
+
+    await purgeCloudflareUrls([
+        `${CF_PUBLIC_DOMAIN}/${imageFileName}`,
+        `${CF_PUBLIC_DOMAIN}/Slotblurbs.txt`,
+        `${CF_PUBLIC_DOMAIN}/LastUpdate.txt`
+    ]);
+
+    await statusMsg.edit(
+        'Uploaded. Waiting 30 seconds for Cloudinary CDN propagation...\n' +
+        'アップロード完了。CDNの反映を30秒間待機しています...'
+    );
+    await new Promise(resolve => setTimeout(resolve, 30000));
+
+    const currentSlotBlurb = await fetchSingleBlurb(slotNumber);
+
+    const targetSlotChannel = guild.channels.cache.find(c => c.name === `slot-${slotNumber}`);
+    if (targetSlotChannel) {
+        const msgs = await targetSlotChannel.messages.fetch({ limit: 15 });
+        for (const msg of msgs.values()) {
+            await msg.delete().catch(() => { });
+        }
+
+        await targetSlotChannel.send({
+            embeds: [buildPreviewEmbed(slotNumber, cloudinaryImageResult.version, currentSlotBlurb)]
+        });
+
+        await targetSlotChannel.permissionOverwrites.delete(submitter.id).catch(() => { });
+        await targetSlotChannel.send(
+            `<@${submitter.id}> Your submission for **Slot #${slotNumber}** was accepted and is live.\n` +
+            `スロット #${slotNumber} への投稿が承認され、公開されました。`
+        );
+    }
+
+    await statusMsg.edit(
+        `Slot #${slotNumber} is now live with submission by <@${submitter.id}>.\n` +
+        `スロット #${slotNumber} に <@${submitter.id}> の作品が公開されました。`
+    );
 }
 
 // ==========================================
@@ -678,7 +764,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
 });
 
-// Listener: Reaction Added (Voting verification, Moderator deletion, Admin ban)
+// Listener: Reaction Added (Voting verification, Moderator deletion, Sightengine Check)
 client.on(Events.MessageReactionAdd, async (reaction, user) => {
     if (user.bot) return;
 
@@ -721,35 +807,43 @@ client.on(Events.MessageReactionAdd, async (reaction, user) => {
         return;
     }
 
-    // Robot Reaction: Admin-only Ban confirmation
+    // Robot Reaction: Sightengine AI Image Detection Check
     if (reaction.emoji.name === '🤖') {
-        if (!isAdmin) {
+        // Moderator or Admin only
+        if (!isMod && !isAdmin) {
             await reaction.users.remove(user.id).catch(() => { });
             return;
         }
 
-        const brickReaction = await message.react('🧱').catch(() => null);
-        if (!brickReaction) return;
+        const attachment = message.attachments.first();
+        if (!attachment || !attachment.contentType?.startsWith('image/')) {
+            await reaction.users.remove(user.id).catch(() => { });
+            return;
+        }
 
-        const filter = (r, u) => r.emoji.name === '🧱' && u.id === user.id;
-        const collector = message.createReactionCollector({ filter, time: 10000, max: 1 });
+        try {
+            const result = await querySightengine(attachment.url);
+            const formattedJson = JSON.stringify(result, null, 2);
 
-        collector.on('collect', async () => {
-            const targetAuthor = message.author;
-            if (targetAuthor) {
-                await guild.members.ban(targetAuthor.id, {
-                    reason: `Submission banned by administrator ${user.tag}`
-                }).catch(err => console.error('Ban error:', err));
-
-                await message.delete().catch(() => { });
+            if (formattedJson.length <= 1900) {
+                await message.reply({
+                    content: `Sightengine Analysis Result (${SIGHTENGINE_MODELS}):\n\`\`\`json\n${formattedJson}\n\`\`\``
+                });
+            } else {
+                await message.reply({
+                    content: `Sightengine Analysis Result (${SIGHTENGINE_MODELS}):`,
+                    files: [{
+                        attachment: Buffer.from(formattedJson, 'utf-8'),
+                        name: 'sightengine_result.json'
+                    }]
+                });
             }
-        });
-
-        collector.on('end', async (collected) => {
-            if (collected.size === 0) {
-                await message.reactions.cache.get('🧱')?.remove().catch(() => { });
-            }
-        });
+        } catch (err) {
+            console.error('Sightengine Analysis Error:', err);
+            await message.reply(`Sightengine Analysis Failed: ${err?.message || err}`);
+        } finally {
+            await reaction.users.remove(user.id).catch(() => { });
+        }
     }
 });
 
@@ -757,56 +851,57 @@ client.on(Events.MessageCreate, async (message) => {
     if (message.author.bot) return;
 
     // ----------------------------------------------------
-    // SUBMISSIONS CHANNEL HANDLER
+    // COMMAND: !approve <1-16> (Reply-to submission)
     // ----------------------------------------------------
-    if (message.channel.name === 'submissions') {
-        const now = Date.now();
-        const lastSubmit = submissionCooldowns.get(message.author.id);
+    if (message.content.startsWith('!approve')) {
+        const modRole = await getOrCreateModeratorRole(message.guild);
         const isAdmin = message.member.permissions.has(PermissionFlagsBits.Administrator);
+        const isMod = message.member.roles.cache.has(modRole.id);
 
-        // 3-Day Slowmode Enforcement (bypassed for Administrators)
-        if (!isAdmin && lastSubmit && (now - lastSubmit < THREE_DAYS_MS)) {
-            const remainingHours = Math.ceil((THREE_DAYS_MS - (now - lastSubmit)) / (1000 * 60 * 60));
-            await message.delete().catch(() => { });
-
-            const warning = await message.channel.send(
-                `<@${message.author.id}>\n` +
-                `You may only post once every 3 days. Please wait ${remainingHours} more hour(s).\n` +
-                `投稿は3日に1度のみ可能です。あと ${remainingHours} 時間お待ちください。`
-            );
-            setTimeout(() => warning.delete().catch(() => { }), 6000);
-            return;
+        if (!isAdmin && !isMod) {
+            return message.reply('Only Content Moderators and Administrators can approve submissions.');
         }
 
-        const attachment = message.attachments.first();
-        const isImage = attachment && attachment.contentType?.startsWith('image/');
-        const lines = message.content.trim().split(/\r?\n/).filter(line => line.trim().length > 0);
-
-        // Format validation: Image + exactly 3 lines of text
-        if (!isImage || lines.length !== 3) {
-            await message.delete().catch(() => { });
-
-            const explanation = await message.channel.send(
-                `<@${message.author.id}>\n` +
-                `Submission rejected. Your post must include an image file and exactly 3 lines of text.\n` +
-                `投稿が取り消されました。画像ファイルを1点添付し、テキストを正確に3行入力してください。`
-            );
-            setTimeout(() => explanation.delete().catch(() => { }), 7000);
-            return;
+        if (!message.reference || !message.reference.messageId) {
+            return message.reply('Reply to the submission message you want to approve with `!approve <1-16>`.');
         }
 
-        // Valid submission: update cooldown (if not admin) and apply reactions
-        if (!isAdmin) {
-            submissionCooldowns.set(message.author.id, now);
+        const args = message.content.trim().split(/\s+/);
+        const slotNumber = parseInt(args[1], 10);
+        if (isNaN(slotNumber) || slotNumber < 1 || slotNumber > 16) {
+            return message.reply('Specify a valid slot number from 1 to 16. Example: `!approve 14`');
         }
+
+        const targetMessage = await message.channel.messages.fetch(message.reference.messageId).catch(() => null);
+        if (!targetMessage) {
+            return message.reply('Could not find the replied-to submission message.');
+        }
+
+        const attachment = targetMessage.attachments.first();
+        if (!attachment || !attachment.contentType?.startsWith('image/')) {
+            return message.reply('The replied-to message does not contain a valid image attachment.');
+        }
+
+        const blurbContent = targetMessage.content.trim() || 'No description provided.';
+        const submitter = targetMessage.author;
 
         try {
-            await message.react('⬆️');
-            await message.react('⬇️');
-            await message.react('🗑️');
-            await message.react('🤖');
+            const response = await fetch(attachment.url);
+            const arrayBuffer = await response.arrayBuffer();
+            const rawBuffer = Buffer.from(arrayBuffer);
+
+            await deploySlotUpdate({
+                guild: message.guild,
+                slotNumber,
+                rawImageBuffer: rawBuffer,
+                blurbContent,
+                submitter,
+                approverUser: message.author,
+                feedbackChannel: message.channel
+            });
         } catch (err) {
-            console.error('Error adding reactions to submission:', err);
+            console.error('Error during !approve:', err);
+            message.reply(`Error deploying approval: ${err?.message || err}`);
         }
         return;
     }
@@ -947,7 +1042,62 @@ client.on(Events.MessageCreate, async (message) => {
     }
 
     // ----------------------------------------------------
-    // LISTENER: Image upload + Text in slot channels
+    // SUBMISSIONS CHANNEL HANDLER
+    // ----------------------------------------------------
+    if (message.channel.name === 'submissions') {
+        const now = Date.now();
+        const lastSubmit = submissionCooldowns.get(message.author.id);
+        const isAdmin = message.member.permissions.has(PermissionFlagsBits.Administrator);
+
+        // 3-Day Slowmode Enforcement (bypassed for Administrators)
+        if (!isAdmin && lastSubmit && (now - lastSubmit < THREE_DAYS_MS)) {
+            const remainingHours = Math.ceil((THREE_DAYS_MS - (now - lastSubmit)) / (1000 * 60 * 60));
+            await message.delete().catch(() => { });
+
+            const warning = await message.channel.send(
+                `<@${message.author.id}>\n` +
+                `You may only post once every 3 days. Please wait ${remainingHours} more hour(s).\n` +
+                `投稿は3日に1度のみ可能です。あと ${remainingHours} 時間お待ちください。`
+            );
+            setTimeout(() => warning.delete().catch(() => { }), 6000);
+            return;
+        }
+
+        const attachment = message.attachments.first();
+        const isImage = attachment && attachment.contentType?.startsWith('image/');
+        const lines = message.content.trim().split(/\r?\n/).filter(line => line.trim().length > 0);
+
+        // Format validation: Image + exactly 3 lines of text
+        if (!isImage || lines.length !== 3) {
+            await message.delete().catch(() => { });
+
+            const explanation = await message.channel.send(
+                `<@${message.author.id}>\n` +
+                `Submission rejected. Your post must include an image file and exactly 3 lines of text.\n` +
+                `投稿が取り消されました。画像ファイルを1点添付し、テキストを正確に3行入力してください。`
+            );
+            setTimeout(() => explanation.delete().catch(() => { }), 7000);
+            return;
+        }
+
+        // Valid submission: update cooldown (if not admin) and apply reactions
+        if (!isAdmin) {
+            submissionCooldowns.set(message.author.id, now);
+        }
+
+        try {
+            await message.react('⬆️');
+            await message.react('⬇️');
+            await message.react('🗑️');
+            await message.react('🤖');
+        } catch (err) {
+            console.error('Error adding reactions to submission:', err);
+        }
+        return;
+    }
+
+    // ----------------------------------------------------
+    // LISTENER: Direct image upload in slot channels
     // ----------------------------------------------------
     const match = message.channel.name.match(/^slot-([1-9]|1[0-6])$/);
     if (!match) return;
@@ -1044,61 +1194,15 @@ client.on(Events.MessageCreate, async (message) => {
             await message.channel.permissionOverwrites.delete(modRole.id).catch(() => { });
 
             if (reaction.emoji.name === '✅') {
-                await message.channel.permissionOverwrites.delete(submitter.id).catch(() => { });
-
-                const statusMsg = await message.channel.send(
-                    `Approved by ${user.tag}. Converting to WebP and updating Slotblurbs.txt...\n` +
-                    `${user.tag} によって承認されました。WebPへの変換と Slotblurbs.txt の更新中...`
-                );
-
-                const webpBuffer = await sharp(rawBuffer)
-                    .resize(2048, 2048, { fit: 'inside', withoutEnlargement: true })
-                    .webp({ quality: 95 })
-                    .toBuffer();
-
-                const imageFileName = `Slot${slotNumber}.webp`;
-
-                const updatedMasterBlurbs = await updateMasterBlurbs(slotNumber, blurbContent);
-                const lastUpdateContent = generateLastUpdateContent(slotNumber, blurbContent);
-
-                const [cloudinaryImageResult] = await Promise.all([
-                    uploadImageStream(webpBuffer, `Slot${slotNumber}`),
-                    uploadTextStream(updatedMasterBlurbs, 'Slotblurbs.txt'),
-                    uploadTextStream(lastUpdateContent, 'LastUpdate.txt'),
-
-                    uploadToR2(webpBuffer, imageFileName, 'image/webp'),
-                    uploadToR2(Buffer.from(updatedMasterBlurbs, 'utf-8'), 'Slotblurbs.txt', 'text/plain; charset=utf-8'),
-                    uploadToR2(Buffer.from(lastUpdateContent, 'utf-8'), 'LastUpdate.txt', 'text/plain; charset=utf-8')
-                ]);
-
-                await purgeCloudflareUrls([
-                    `${CF_PUBLIC_DOMAIN}/${imageFileName}`,
-                    `${CF_PUBLIC_DOMAIN}/Slotblurbs.txt`,
-                    `${CF_PUBLIC_DOMAIN}/LastUpdate.txt`
-                ]);
-
-                await statusMsg.edit(
-                    'Uploaded. Waiting 30 seconds for Cloudinary CDN propagation...\n' +
-                    'アップロード完了。CDNの反映を30秒間待機しています...'
-                );
-                await new Promise(resolve => setTimeout(resolve, 30000));
-
-                const currentSlotBlurb = await fetchSingleBlurb(slotNumber);
-
-                const msgs = await message.channel.messages.fetch({ limit: 15 });
-                for (const msg of msgs.values()) {
-                    await msg.delete().catch(() => { });
-                }
-
-                await message.channel.send({
-                    embeds: [buildPreviewEmbed(slotNumber, cloudinaryImageResult.version, currentSlotBlurb)]
+                await deploySlotUpdate({
+                    guild: message.guild,
+                    slotNumber,
+                    rawImageBuffer: rawBuffer,
+                    blurbContent,
+                    submitter,
+                    approverUser: user,
+                    feedbackChannel: message.channel
                 });
-
-                await message.channel.send(
-                    `<@${submitter.id}> Your submission for **Slot #${slotNumber}** was accepted and is live. Your access to this slot channel has ended.\n` +
-                    `スロット #${slotNumber} への投稿が承認され、公開されました。このスロットへのアクセス権は終了しました。`
-                );
-
             } else if (reaction.emoji.name === '❌') {
                 await message.channel.send(
                     `Submission rejected by ${user.tag}. Resetting channel view...\n` +
