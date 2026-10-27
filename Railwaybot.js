@@ -845,7 +845,7 @@ client.on(Events.MessageReactionAdd, async (reaction, user) => {
     }
 
     // Robot Reaction: Sightengine AI Image Detection Check
-    if (reaction.emoji.name === '🤖') {
+   if (reaction.emoji.name === '🤖') {
         if (!isMod && !isAdmin) {
             await reaction.users.remove(user.id).catch(() => { });
             return;
@@ -882,11 +882,11 @@ client.on(Events.MessageReactionAdd, async (reaction, user) => {
             const imageBuffer = Buffer.from(imageArrayBuffer);
             const fileName = attachment.name || 'submission.png';
 
-            // Send report to #ai-logs
+            // Send report to #ai-logs with pinged @user and raw userID
             const aiLogsChannel = guild.channels.cache.find(c => c.name === 'ai-logs');
             if (aiLogsChannel) {
                 await aiLogsChannel.send({
-                    content: `${message.author.tag} submission at ${percentStr} certainty of AI generation on ${dateStr}`,
+                    content: `<@${message.author.id}> (${message.author.id}) submission at ${percentStr} certainty of AI generation on ${dateStr}`,
                     files: [{
                         attachment: imageBuffer,
                         name: fileName
