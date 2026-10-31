@@ -143,6 +143,77 @@ const NUMBER_EMOJIS = {
 // 2. HELPER FUNCTIONS (SLOTS & STORAGE)
 // ==========================================
 
+function getNextGroupChangeInfo() {
+    // Starting Sunday, November 15, 2026 UTC
+    const startDate = new Date(Date.UTC(2026, 10, 15, 0, 0, 0));
+    const weekMs = 7 * 24 * 60 * 60 * 1000;
+    const groupOrder = ['Group D', 'Group C', 'Group B', 'Group A'];
+    const now = new Date();
+
+    if (now.getTime() < startDate.getTime()) {
+        return {
+            date: startDate,
+            group: 'Group D'
+        };
+    }
+
+    const diff = now.getTime() - startDate.getTime();
+    const cycleIndex = Math.floor(diff / weekMs) + 1;
+    const nextDate = new Date(startDate.getTime() + cycleIndex * weekMs);
+    const nextGroup = groupOrder[cycleIndex % groupOrder.length];
+
+    return {
+        date: nextDate,
+        group: nextGroup
+    };
+}
+
+async function syncNextChangeVoiceChannel(guild, automationCategory) {
+    const info = getNextGroupChangeInfo();
+    const dateStr = info.date.toLocaleDateString('en-US', {
+        month: 'short',
+        day: 'numeric',
+        year: 'numeric',
+        timeZone: 'UTC'
+    });
+    const desiredChannelName = `📅 ${dateStr} - ${info.group}`;
+
+    let vc = guild.channels.cache.find(
+        c => c.parentId === automationCategory.id && c.type === ChannelType.GuildVoice
+    );
+
+    const lockedPermissions = [
+        {
+            id: guild.roles.everyone.id,
+            allow: [PermissionFlagsBits.ViewChannel],
+            deny: [PermissionFlagsBits.Connect]
+        },
+        {
+            id: client.user.id,
+            allow: [
+                PermissionFlagsBits.ViewChannel,
+                PermissionFlagsBits.ManageChannels,
+                PermissionFlagsBits.Connect
+            ]
+        }
+    ];
+
+    if (!vc) {
+        vc = await guild.channels.create({
+            name: desiredChannelName,
+            type: ChannelType.GuildVoice,
+            parent: automationCategory.id,
+            permissionOverwrites: lockedPermissions
+        });
+        console.log(`Created locked next-change voice channel: ${desiredChannelName}`);
+    } else {
+        if (vc.name !== desiredChannelName) {
+            await vc.setName(desiredChannelName).catch(() => { });
+            console.log(`Updated next-change voice channel to: ${desiredChannelName}`);
+        }
+    }
+}
+
 async function getOrCreateModeratorRole(guild) {
     let role = guild.roles.cache.find(r => r.name.toLowerCase() === 'content moderator');
     if (!role) {
@@ -184,7 +255,6 @@ async function applyBlindRole(member, guild) {
     const blindRole = await getOrCreateBlindRole(guild);
     await member.roles.add(blindRole).catch(() => { });
 
-    // Apply strict permissions to all channels and categories
     for (const channel of guild.channels.cache.values()) {
         if (channel.name === 'submissions') {
             await channel.permissionOverwrites.edit(blindRole.id, {
@@ -638,7 +708,6 @@ async function swapSlots({ guild, slot1, slot2, feedbackChannel, operatorUser })
         const blurb1 = blurbsMap[slot1] || 'No description provided.';
         const blurb2 = blurbsMap[slot2] || 'No description provided.';
 
-        // Swap the blurbs
         blurbsMap[slot1] = blurb2;
         blurbsMap[slot2] = blurb1;
         const updatedMasterBlurbs = formatBlurbsFile(blurbsMap);
@@ -749,6 +818,9 @@ async function setupChannels(guild) {
         });
     }
 
+    // --- Sync Next Group Change Locked Voice Channel (under AUTOMATION) ---
+    await syncNextChangeVoiceChannel(guild, automationCategory);
+
     // --- Submissions Channel Setup (under AUTOMATION) ---
     let submissionsChannel = guild.channels.cache.find(c => c.name === 'submissions');
     if (!submissionsChannel) {
@@ -812,7 +884,6 @@ async function setupChannels(guild) {
         await submissionsChannel.setParent(automationCategory.id, { lockPermissions: false });
     }
 
-    // Ensure blind role restrictions on submissions channel
     await submissionsChannel.permissionOverwrites.edit(blindRole.id, {
         ViewChannel: false,
         AttachFiles: false,
@@ -934,7 +1005,6 @@ async function setupChannels(guild) {
         }
     }
 
-    // Remove legacy IMAGE SLOTS category if empty
     if (legacyCategory) {
         const hasChildren = guild.channels.cache.some(c => c.parentId === legacyCategory.id);
         if (!hasChildren) {
@@ -963,6 +1033,18 @@ client.on(Events.ClientReady, async () => {
             console.error(`Setup error on ${guild.name}:`, err);
         }
     }
+
+    // Periodic check every 30 minutes to roll over the locked voice channel name
+    setInterval(async () => {
+        for (const guild of client.guilds.cache.values()) {
+            const automationCategory = guild.channels.cache.find(
+                c => c.name.toLowerCase() === 'automation' && c.type === ChannelType.GuildCategory
+            );
+            if (automationCategory) {
+                await syncNextChangeVoiceChannel(guild, automationCategory).catch(() => { });
+            }
+        }
+    }, 30 * 60 * 1000);
 });
 
 // Listener: Embedded Button Interactions
@@ -1076,7 +1158,6 @@ client.on(Events.MessageReactionAdd, async (reaction, user) => {
             return;
         }
 
-        // Prevent repeated detections
         if (scannedAiSubmissions.has(message.id)) {
             await reaction.users.remove(user.id).catch(() => { });
             return;
@@ -1091,17 +1172,14 @@ client.on(Events.MessageReactionAdd, async (reaction, user) => {
         scannedAiSubmissions.add(message.id);
 
         try {
-            // Remove robot reaction to prevent re-triggers
             await message.reactions.cache.get('🤖')?.remove().catch(() => { });
 
-            // Query Sightengine
             const result = await querySightengine(attachment.url);
             const aiScore = result.type?.ai_generated;
             const percent = (aiScore !== undefined) ? (aiScore * 100) : 0;
             const percentStr = (aiScore !== undefined) ? `${percent.toFixed(1)}%` : 'unknown%';
             const dateStr = new Date().toISOString().replace('T', ' ').substring(0, 19) + ' UTC';
 
-            // Download original image for re-upload/logging
             const imageResponse = await fetch(attachment.url);
             const imageArrayBuffer = await imageResponse.arrayBuffer();
             const imageBuffer = Buffer.from(imageArrayBuffer);
@@ -1110,7 +1188,6 @@ client.on(Events.MessageReactionAdd, async (reaction, user) => {
             const authorId = message.author.id;
             const authorMember = await guild.members.fetch(authorId).catch(() => null);
 
-            // 1. Log to #ai-logs channel
             const aiLogsChannel = guild.channels.cache.find(c => c.name === 'ai-logs');
             let logStatusNote = '';
 
@@ -1133,20 +1210,14 @@ client.on(Events.MessageReactionAdd, async (reaction, user) => {
                 });
             }
 
-            // 2. Automated Action based on percentage thresholds
             if (percent > 55) {
-                // Delete submission automatically
                 await message.delete().catch(() => { });
-
-                // Assign Blind role to poster
                 if (authorMember) {
                     await applyBlindRole(authorMember, guild);
                 }
             } else if (percent < 10) {
-                // Below 10%: React with blue circle
                 await message.react('🔵').catch(() => { });
             } else {
-                // Between 10% and 55%: Round up to nearest multiple of 5 (e.g. 42 -> 45)
                 const rounded = Math.min(55, Math.max(10, Math.ceil(percent / 5) * 5));
                 const digits = rounded.toString();
                 const d1 = digits[0];
@@ -1156,7 +1227,6 @@ client.on(Events.MessageReactionAdd, async (reaction, user) => {
                 if (d1 !== d2) {
                     await message.react(NUMBER_EMOJIS[d2]).catch(() => { });
                 } else {
-                    // For identical digits (55), react with raised 5-finger hand
                     await message.react('🖐️').catch(() => { });
                 }
             }
@@ -1409,7 +1479,6 @@ client.on(Events.MessageCreate, async (message) => {
         const lastSubmit = submissionCooldowns.get(message.author.id);
         const isAdmin = message.member.permissions.has(PermissionFlagsBits.Administrator);
 
-        // 3-Day Slowmode Enforcement (bypassed for Administrators)
         if (!isAdmin && lastSubmit && (now - lastSubmit < THREE_DAYS_MS)) {
             const remainingHours = Math.ceil((THREE_DAYS_MS - (now - lastSubmit)) / (1000 * 60 * 60));
             await message.delete().catch(() => { });
@@ -1427,7 +1496,6 @@ client.on(Events.MessageCreate, async (message) => {
         const isImage = attachment && attachment.contentType?.startsWith('image/');
         const lines = message.content.trim().split(/\r?\n/).filter(line => line.trim().length > 0);
 
-        // Format validation: Image + exactly 3 lines of text
         if (!isImage || lines.length !== 3) {
             await message.delete().catch(() => { });
 
@@ -1440,7 +1508,6 @@ client.on(Events.MessageCreate, async (message) => {
             return;
         }
 
-        // Valid submission: update cooldown (if not admin) and apply reactions
         if (!isAdmin) {
             submissionCooldowns.set(message.author.id, now);
         }
