@@ -117,6 +117,28 @@ let switchesState = [
     { id: 3, key: 'Switch3', state: false, description: 'Default description for Switch 3' }
 ];
 
+// Group Configuration for Slots
+const SLOT_GROUPS = [
+    { name: 'Group A', slots: [7, 3, 11, 13] },
+    { name: 'Group B', slots: [5, 6, 16, 15] },
+    { name: 'Group C', slots: [9, 8, 14, 12] },
+    { name: 'Group D', slots: [1, 2, 4, 10] }
+];
+
+// Number Emoji Mapping
+const NUMBER_EMOJIS = {
+    '0': '0️⃣',
+    '1': '1️⃣',
+    '2': '2️⃣',
+    '3': '3️⃣',
+    '4': '4️⃣',
+    '5': '5️⃣',
+    '6': '6️⃣',
+    '7': '7️⃣',
+    '8': '8️⃣',
+    '9': '9️⃣'
+};
+
 // ==========================================
 // 2. HELPER FUNCTIONS (SLOTS & STORAGE)
 // ==========================================
@@ -143,6 +165,40 @@ async function getOrCreateVotersRole(guild) {
         console.log(`Created Voters role in ${guild.name}`);
     }
     return role;
+}
+
+async function getOrCreateBlindRole(guild) {
+    let role = guild.roles.cache.find(r => r.name.toLowerCase() === 'blind');
+    if (!role) {
+        role = await guild.roles.create({
+            name: 'Blind',
+            color: '#34495e',
+            reason: 'Role restricted from posting attachments, links, and accessing submissions'
+        });
+        console.log(`Created Blind role in ${guild.name}`);
+    }
+    return role;
+}
+
+async function applyBlindRole(member, guild) {
+    const blindRole = await getOrCreateBlindRole(guild);
+    await member.roles.add(blindRole).catch(() => { });
+
+    // Apply strict permissions to all channels and categories
+    for (const channel of guild.channels.cache.values()) {
+        if (channel.name === 'submissions') {
+            await channel.permissionOverwrites.edit(blindRole.id, {
+                ViewChannel: false,
+                AttachFiles: false,
+                EmbedLinks: false
+            }).catch(() => { });
+        } else if (channel.type === ChannelType.GuildCategory || channel.isTextBased()) {
+            await channel.permissionOverwrites.edit(blindRole.id, {
+                AttachFiles: false,
+                EmbedLinks: false
+            }).catch(() => { });
+        }
+    }
 }
 
 function getPermanentImageUrl(slotNumber) {
@@ -538,7 +594,6 @@ async function deploySlotUpdate({
         );
     }
 
-    // Delete the approved submission and the !approve command message
     if (submissionMessage) {
         await submissionMessage.delete().catch(() => { });
     }
@@ -551,7 +606,6 @@ async function deploySlotUpdate({
             `Slot #${slotNumber} is now live with submission by <@${submitter.id}>.\n` +
             `スロット #${slotNumber} に <@${submitter.id}> の作品が公開されました。 (Cleaning up...)`
         );
-        // Automatically remove the acceptance status message after 8 seconds to keep #submissions clear
         setTimeout(() => {
             statusMsg.delete().catch(() => { });
         }, 8000);
@@ -600,7 +654,6 @@ async function swapSlots({ guild, slot1, slot2, feedbackChannel, operatorUser })
         await statusMsg.edit('Uploading swapped assets to Cloudinary & Cloudflare R2...\nストレージへ反映中...');
 
         const [cldRes1, cldRes2] = await Promise.all([
-            // Image 1 is now Slot 2, Image 2 is now Slot 1
             uploadImageStream(buffer2, `Slot${slot1}`),
             uploadImageStream(buffer1, `Slot${slot2}`),
             uploadTextStream(updatedMasterBlurbs, 'Slotblurbs.txt'),
@@ -622,7 +675,6 @@ async function swapSlots({ guild, slot1, slot2, feedbackChannel, operatorUser })
         await statusMsg.edit('Uploaded. Waiting 20 seconds for CDN cache propagation...\nCDNの反映を20秒間待機しています...');
         await new Promise(resolve => setTimeout(resolve, 20000));
 
-        // Re-render Discord slot preview channels
         const channel1 = guild.channels.cache.find(c => c.name === `slot-${slot1}`);
         const channel2 = guild.channels.cache.find(c => c.name === `slot-${slot2}`);
 
@@ -651,11 +703,19 @@ async function setupChannels(guild) {
     console.log(`Setting up channels for guild: ${guild.name}...`);
     const modRole = await getOrCreateModeratorRole(guild);
     const votersRole = await getOrCreateVotersRole(guild);
+    const blindRole = await getOrCreateBlindRole(guild);
 
     const basePermissions = [
         {
             id: guild.roles.everyone.id,
             deny: [PermissionFlagsBits.ViewChannel]
+        },
+        {
+            id: blindRole.id,
+            deny: [
+                PermissionFlagsBits.AttachFiles,
+                PermissionFlagsBits.EmbedLinks
+            ]
         },
         {
             id: client.user.id,
@@ -672,18 +732,9 @@ async function setupChannels(guild) {
         }
     ];
 
-    // --- Category: IMAGE SLOTS ---
-    let slotsCategory = guild.channels.cache.find(
+    const legacyCategory = guild.channels.cache.find(
         c => c.name.toLowerCase() === 'image slots' && c.type === ChannelType.GuildCategory
     );
-
-    if (!slotsCategory) {
-        slotsCategory = await guild.channels.create({
-            name: 'IMAGE SLOTS',
-            type: ChannelType.GuildCategory,
-            permissionOverwrites: basePermissions
-        });
-    }
 
     // --- Category: AUTOMATION ---
     let automationCategory = guild.channels.cache.find(
@@ -716,6 +767,14 @@ async function setupChannels(guild) {
                     ],
                     deny: [
                         PermissionFlagsBits.ReadMessageHistory
+                    ]
+                },
+                {
+                    id: blindRole.id,
+                    deny: [
+                        PermissionFlagsBits.ViewChannel,
+                        PermissionFlagsBits.AttachFiles,
+                        PermissionFlagsBits.EmbedLinks
                     ]
                 },
                 {
@@ -752,6 +811,13 @@ async function setupChannels(guild) {
     } else if (submissionsChannel.parentId !== automationCategory.id) {
         await submissionsChannel.setParent(automationCategory.id, { lockPermissions: false });
     }
+
+    // Ensure blind role restrictions on submissions channel
+    await submissionsChannel.permissionOverwrites.edit(blindRole.id, {
+        ViewChannel: false,
+        AttachFiles: false,
+        EmbedLinks: false
+    }).catch(() => { });
 
     // --- Light Switches Channel Setup (under AUTOMATION) ---
     let lightsChannel = guild.channels.cache.find(c => c.name === 'light-switches');
@@ -820,35 +886,65 @@ async function setupChannels(guild) {
         await aiLogsChannel.setParent(automationCategory.id, { lockPermissions: false });
     }
 
-    // --- Slot Channels Setup (under IMAGE SLOTS) ---
-    for (let i = 1; i <= 16; i++) {
-        const channelName = `slot-${i}`;
-        let channel = guild.channels.cache.find(
-            c => c.name === channelName && c.parentId === slotsCategory.id
+    // --- Groups A, B, C, D Category and Slot Setup ---
+    for (const group of SLOT_GROUPS) {
+        let category = guild.channels.cache.find(
+            c => c.name.toLowerCase() === group.name.toLowerCase() && c.type === ChannelType.GuildCategory
         );
 
-        if (!channel) {
-            channel = await guild.channels.create({
-                name: channelName,
-                type: ChannelType.GuildText,
-                parent: slotsCategory.id,
-                permissionOverwrites: basePermissions,
-                topic: `Upload an image + caption here to update Slot #${i}`
+        if (!category) {
+            category = await guild.channels.create({
+                name: group.name,
+                type: ChannelType.GuildCategory,
+                permissionOverwrites: basePermissions
             });
-            console.log(`Created private channel #${channelName}`);
+            console.log(`Created category ${group.name}`);
+        } else {
+            await category.permissionOverwrites.edit(blindRole.id, {
+                AttachFiles: false,
+                EmbedLinks: false
+            }).catch(() => { });
         }
 
-        const messages = await channel.messages.fetch({ limit: 10 });
-        const botMessage = messages.find(m => m.author.id === client.user.id);
+        for (const slotNum of group.slots) {
+            const channelName = `slot-${slotNum}`;
+            let channel = guild.channels.cache.find(c => c.name === channelName);
 
-        if (!botMessage) {
-            const currentBlurb = await fetchSingleBlurb(i);
-            await channel.send({ embeds: [buildPreviewEmbed(i, null, currentBlurb)] });
+            if (!channel) {
+                channel = await guild.channels.create({
+                    name: channelName,
+                    type: ChannelType.GuildText,
+                    parent: category.id,
+                    permissionOverwrites: basePermissions,
+                    topic: `Upload an image + caption here to update Slot #${slotNum}`
+                });
+                console.log(`Created private channel #${channelName} under ${group.name}`);
+            } else if (channel.parentId !== category.id) {
+                await channel.setParent(category.id, { lockPermissions: false });
+                console.log(`Moved #${channelName} under ${group.name}`);
+            }
+
+            const messages = await channel.messages.fetch({ limit: 10 }).catch(() => null);
+            const botMessage = messages ? messages.find(m => m.author.id === client.user.id) : null;
+
+            if (!botMessage) {
+                const currentBlurb = await fetchSingleBlurb(slotNum);
+                await channel.send({ embeds: [buildPreviewEmbed(slotNum, null, currentBlurb)] });
+            }
+        }
+    }
+
+    // Remove legacy IMAGE SLOTS category if empty
+    if (legacyCategory) {
+        const hasChildren = guild.channels.cache.some(c => c.parentId === legacyCategory.id);
+        if (!hasChildren) {
+            await legacyCategory.delete().catch(() => { });
+            console.log('Removed empty legacy IMAGE SLOTS category.');
         }
     }
 
     await renderLightSwitchesChannel(lightsChannel, switchesState);
-    console.log('Channels and switches are synced.');
+    console.log('Channels, categories, roles, and switches are synced.');
 }
 
 // ==========================================
@@ -992,35 +1088,77 @@ client.on(Events.MessageReactionAdd, async (reaction, user) => {
             return;
         }
 
-        // Mark as scanned
         scannedAiSubmissions.add(message.id);
 
         try {
-            // Remove the robot reactions so it cannot be re-triggered
+            // Remove robot reaction to prevent re-triggers
             await message.reactions.cache.get('🤖')?.remove().catch(() => { });
 
             // Query Sightengine
             const result = await querySightengine(attachment.url);
             const aiScore = result.type?.ai_generated;
-            const percentStr = (aiScore !== undefined) ? `${(aiScore * 100).toFixed(1)}%` : 'unknown%';
+            const percent = (aiScore !== undefined) ? (aiScore * 100) : 0;
+            const percentStr = (aiScore !== undefined) ? `${percent.toFixed(1)}%` : 'unknown%';
             const dateStr = new Date().toISOString().replace('T', ' ').substring(0, 19) + ' UTC';
 
-            // Download original image for re-upload
+            // Download original image for re-upload/logging
             const imageResponse = await fetch(attachment.url);
             const imageArrayBuffer = await imageResponse.arrayBuffer();
             const imageBuffer = Buffer.from(imageArrayBuffer);
             const fileName = attachment.name || 'submission.png';
 
-            // Send report to #ai-logs with pinged @user and raw userID
+            const authorId = message.author.id;
+            const authorMember = await guild.members.fetch(authorId).catch(() => null);
+
+            // 1. Log to #ai-logs channel
             const aiLogsChannel = guild.channels.cache.find(c => c.name === 'ai-logs');
+            let logStatusNote = '';
+
+            if (percent > 55) {
+                logStatusNote = ' - **[AUTO-DELETED & BLIND ROLE ASSIGNED]**';
+            } else if (percent < 10) {
+                logStatusNote = ' - **[MARKED WITH 🔵]**';
+            } else {
+                const rounded = Math.ceil(percent / 5) * 5;
+                logStatusNote = ` - **[ROUNDED TO ${rounded}%]**`;
+            }
+
             if (aiLogsChannel) {
                 await aiLogsChannel.send({
-                    content: `<@${message.author.id}> (${message.author.id}) submission at ${percentStr} certainty of AI generation on ${dateStr}`,
+                    content: `<@${authorId}> (${authorId}) submission at ${percentStr} certainty of AI generation on ${dateStr}${logStatusNote}`,
                     files: [{
                         attachment: imageBuffer,
                         name: fileName
                     }]
                 });
+            }
+
+            // 2. Automated Action based on percentage thresholds
+            if (percent > 55) {
+                // Delete submission automatically
+                await message.delete().catch(() => { });
+
+                // Assign Blind role to poster
+                if (authorMember) {
+                    await applyBlindRole(authorMember, guild);
+                }
+            } else if (percent < 10) {
+                // Below 10%: React with blue circle
+                await message.react('🔵').catch(() => { });
+            } else {
+                // Between 10% and 55%: Round up to nearest multiple of 5 (e.g. 42 -> 45)
+                const rounded = Math.min(55, Math.max(10, Math.ceil(percent / 5) * 5));
+                const digits = rounded.toString();
+                const d1 = digits[0];
+                const d2 = digits[1];
+
+                await message.react(NUMBER_EMOJIS[d1]).catch(() => { });
+                if (d1 !== d2) {
+                    await message.react(NUMBER_EMOJIS[d2]).catch(() => { });
+                } else {
+                    // For identical digits (55), react with raised 5-finger hand
+                    await message.react('🖐️').catch(() => { });
+                }
             }
         } catch (err) {
             console.error('Sightengine Analysis Error:', err);
