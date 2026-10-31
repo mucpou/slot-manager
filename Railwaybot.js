@@ -236,6 +236,24 @@ async function querySightengine(imageUrl) {
     return await response.json();
 }
 
+async function fetchSlotImageBuffer(slotNumber) {
+    const candidates = [
+        `${CF_PUBLIC_DOMAIN}/Slot${slotNumber}.webp?t=${Date.now()}`,
+        `${getPermanentImageUrl(slotNumber)}?t=${Date.now()}`
+    ];
+
+    for (const url of candidates) {
+        try {
+            const res = await fetch(url);
+            if (res.ok) {
+                const arrayBuffer = await res.arrayBuffer();
+                return Buffer.from(arrayBuffer);
+            }
+        } catch (err) { }
+    }
+    throw new Error(`Unable to fetch existing image for Slot #${slotNumber}`);
+}
+
 // ==========================================
 // LIGHT SWITCHES LOGIC & SYNCHRONIZATION
 // ==========================================
@@ -438,20 +456,32 @@ function buildPreviewEmbed(slotNumber, version = null, blurbText = 'No text load
         .setTimestamp();
 }
 
-async function renderSlotChannel(channel, slotNumber) {
+async function renderSlotChannel(channel, slotNumber, version = null) {
     const messages = await channel.messages.fetch({ limit: 50 });
     for (const msg of messages.values()) {
         await msg.delete().catch(() => { });
     }
     const currentBlurb = await fetchSingleBlurb(slotNumber);
-    await channel.send({ embeds: [buildPreviewEmbed(slotNumber, null, currentBlurb)] });
+    await channel.send({ embeds: [buildPreviewEmbed(slotNumber, version, currentBlurb)] });
 }
 
 // ==========================================
 // UNIFIED PIPELINE FOR DEPLOYING SLOT UPDATES
 // ==========================================
 
-async function deploySlotUpdate({ guild, slotNumber, rawImageBuffer, blurbContent, submitter, approverUser, feedbackChannel }) {
+async function deploySlotUpdate({
+    guild,
+    slotNumber,
+    rawImageBuffer,
+    blurbContent,
+    submitter,
+    approverUser,
+    feedbackChannel,
+    submissionMessage = null,
+    commandMessage = null
+}) {
+    const isSubmissionsChannel = feedbackChannel.name === 'submissions';
+
     const statusMsg = await feedbackChannel.send(
         `Approved by ${approverUser.tag}. Converting to WebP and updating slot #${slotNumber}...\n` +
         `${approverUser.tag} によって承認されました。WebPへの変換とスロット #${slotNumber} を更新中...`
@@ -508,10 +538,109 @@ async function deploySlotUpdate({ guild, slotNumber, rawImageBuffer, blurbConten
         );
     }
 
-    await statusMsg.edit(
-        `Slot #${slotNumber} is now live with submission by <@${submitter.id}>.\n` +
-        `スロット #${slotNumber} に <@${submitter.id}> の作品が公開されました。`
+    // Delete the approved submission and the !approve command message
+    if (submissionMessage) {
+        await submissionMessage.delete().catch(() => { });
+    }
+    if (commandMessage) {
+        await commandMessage.delete().catch(() => { });
+    }
+
+    if (isSubmissionsChannel) {
+        await statusMsg.edit(
+            `Slot #${slotNumber} is now live with submission by <@${submitter.id}>.\n` +
+            `スロット #${slotNumber} に <@${submitter.id}> の作品が公開されました。 (Cleaning up...)`
+        );
+        // Automatically remove the acceptance status message after 8 seconds to keep #submissions clear
+        setTimeout(() => {
+            statusMsg.delete().catch(() => { });
+        }, 8000);
+    } else {
+        await statusMsg.edit(
+            `Slot #${slotNumber} is now live with submission by <@${submitter.id}>.\n` +
+            `スロット #${slotNumber} に <@${submitter.id}> の作品が公開されました。`
+        );
+    }
+}
+
+// ==========================================
+// PIPELINE FOR SWAPPING TWO SLOTS
+// ==========================================
+
+async function swapSlots({ guild, slot1, slot2, feedbackChannel, operatorUser }) {
+    const statusMsg = await feedbackChannel.send(
+        `Initiating swap between Slot #${slot1} and Slot #${slot2} by ${operatorUser.tag}...\n` +
+        `${operatorUser.tag} によるスロット #${slot1} と #${slot2} の入れ替えを開始しています...`
     );
+
+    try {
+        const [buffer1, buffer2, masterText] = await Promise.all([
+            fetchSlotImageBuffer(slot1),
+            fetchSlotImageBuffer(slot2),
+            fetchMasterBlurbsText()
+        ]);
+
+        const blurbsMap = parseBlurbsFile(masterText);
+        const blurb1 = blurbsMap[slot1] || 'No description provided.';
+        const blurb2 = blurbsMap[slot2] || 'No description provided.';
+
+        // Swap the blurbs
+        blurbsMap[slot1] = blurb2;
+        blurbsMap[slot2] = blurb1;
+        const updatedMasterBlurbs = formatBlurbsFile(blurbsMap);
+
+        const lastUpdateContent = [
+            `LastUpdate: ${new Date().toISOString()}`,
+            `UnixTimestamp: ${Math.floor(Date.now() / 1000)}`,
+            `Action: Swapped Slot ${slot1} and Slot ${slot2}`,
+            `MasterTextUrl: ${getPermanentBlurbsUrl()}`,
+            `R2MasterTextUrl: ${CF_PUBLIC_DOMAIN}/Slotblurbs.txt`
+        ].join('\n');
+
+        await statusMsg.edit('Uploading swapped assets to Cloudinary & Cloudflare R2...\nストレージへ反映中...');
+
+        const [cldRes1, cldRes2] = await Promise.all([
+            // Image 1 is now Slot 2, Image 2 is now Slot 1
+            uploadImageStream(buffer2, `Slot${slot1}`),
+            uploadImageStream(buffer1, `Slot${slot2}`),
+            uploadTextStream(updatedMasterBlurbs, 'Slotblurbs.txt'),
+            uploadTextStream(lastUpdateContent, 'LastUpdate.txt'),
+
+            uploadToR2(buffer2, `Slot${slot1}.webp`, 'image/webp'),
+            uploadToR2(buffer1, `Slot${slot2}.webp`, 'image/webp'),
+            uploadToR2(Buffer.from(updatedMasterBlurbs, 'utf-8'), 'Slotblurbs.txt', 'text/plain; charset=utf-8'),
+            uploadToR2(Buffer.from(lastUpdateContent, 'utf-8'), 'LastUpdate.txt', 'text/plain; charset=utf-8')
+        ]);
+
+        await purgeCloudflareUrls([
+            `${CF_PUBLIC_DOMAIN}/Slot${slot1}.webp`,
+            `${CF_PUBLIC_DOMAIN}/Slot${slot2}.webp`,
+            `${CF_PUBLIC_DOMAIN}/Slotblurbs.txt`,
+            `${CF_PUBLIC_DOMAIN}/LastUpdate.txt`
+        ]);
+
+        await statusMsg.edit('Uploaded. Waiting 20 seconds for CDN cache propagation...\nCDNの反映を20秒間待機しています...');
+        await new Promise(resolve => setTimeout(resolve, 20000));
+
+        // Re-render Discord slot preview channels
+        const channel1 = guild.channels.cache.find(c => c.name === `slot-${slot1}`);
+        const channel2 = guild.channels.cache.find(c => c.name === `slot-${slot2}`);
+
+        if (channel1) {
+            await renderSlotChannel(channel1, slot1, cldRes1.version);
+        }
+        if (channel2) {
+            await renderSlotChannel(channel2, slot2, cldRes2.version);
+        }
+
+        await statusMsg.edit(
+            `Successfully swapped Slot #${slot1} and Slot #${slot2}.\n` +
+            `スロット #${slot1} とスロット #${slot2} の入れ替えが完了しました。`
+        );
+    } catch (err) {
+        console.error('Error swapping slots:', err);
+        await statusMsg.edit(`Failed to swap slots: ${err.message || err}`);
+    }
 }
 
 // ==========================================
@@ -845,7 +974,7 @@ client.on(Events.MessageReactionAdd, async (reaction, user) => {
     }
 
     // Robot Reaction: Sightengine AI Image Detection Check
-   if (reaction.emoji.name === '🤖') {
+    if (reaction.emoji.name === '🤖') {
         if (!isMod && !isAdmin) {
             await reaction.users.remove(user.id).catch(() => { });
             return;
@@ -904,6 +1033,44 @@ client.on(Events.MessageCreate, async (message) => {
     if (message.author.bot) return;
 
     // ----------------------------------------------------
+    // COMMAND: !swap <1-16> <1-16>
+    // ----------------------------------------------------
+    if (message.content.startsWith('!swap')) {
+        const modRole = await getOrCreateModeratorRole(message.guild);
+        const isAdmin = message.member.permissions.has(PermissionFlagsBits.Administrator);
+        const isMod = message.member.roles.cache.has(modRole.id);
+
+        if (!isAdmin && !isMod) {
+            return message.reply('Only Content Moderators and Administrators can swap slots.');
+        }
+
+        const args = message.content.trim().split(/\s+/);
+        if (args.length < 3) {
+            return message.reply('Usage: `!swap <slot1> <slot2>`\nExample: `!swap 2 5`');
+        }
+
+        const slot1 = parseInt(args[1], 10);
+        const slot2 = parseInt(args[2], 10);
+
+        if (isNaN(slot1) || slot1 < 1 || slot1 > 16 || isNaN(slot2) || slot2 < 1 || slot2 > 16) {
+            return message.reply('Please specify two valid slot numbers between 1 and 16.');
+        }
+
+        if (slot1 === slot2) {
+            return message.reply('Please provide two different slot numbers to swap.');
+        }
+
+        await swapSlots({
+            guild: message.guild,
+            slot1,
+            slot2,
+            feedbackChannel: message.channel,
+            operatorUser: message.author
+        });
+        return;
+    }
+
+    // ----------------------------------------------------
     // COMMAND: !approve <1-16> (Reply-to submission)
     // ----------------------------------------------------
     if (message.content.startsWith('!approve')) {
@@ -950,7 +1117,9 @@ client.on(Events.MessageCreate, async (message) => {
                 blurbContent,
                 submitter,
                 approverUser: message.author,
-                feedbackChannel: message.channel
+                feedbackChannel: message.channel,
+                submissionMessage: targetMessage,
+                commandMessage: message
             });
         } catch (err) {
             console.error('Error during !approve:', err);
